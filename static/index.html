@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QuantPilot | AI Trading Dashboard</title>
+
+    <!-- Fonts -->
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap"
+        rel="stylesheet">
+    <!-- Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Charts -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+
+<body>
+
+    <!-- Sidebar -->
+    <nav id="sidebar">
+        <div class="brand">
+            <i class="fa-solid fa-chart-line"></i> QuantPilot
+        </div>
+        <div class="nav-links">
+            <a class="nav-item active" data-view="dashboard">
+                <i class="fa-solid fa-house"></i> Dashboard
+            </a>
+            <a class="nav-item" data-view="analysis">
+                <i class="fa-solid fa-magnifying-glass-chart"></i> Analysis
+            </a>
+            <a class="nav-item" data-view="backtest">
+                <i class="fa-solid fa-flask"></i> Backtest
+            </a>
+            <a class="nav-item" data-view="batch">
+                <i class="fa-solid fa-layer-group"></i> Batch
+            </a>
+            <a class="nav-item" data-view="portfolio">
+                <i class="fa-solid fa-wallet"></i> Portfolio
+            </a>
+            <a class="nav-item" data-view="alerts">
+                <i class="fa-solid fa-bell"></i> Alerts
+            </a>
+            <a class="nav-item" data-view="docs">
+                <i class="fa-solid fa-book"></i> API Docs
+            </a>
+            <a class="nav-item" data-view="settings">
+                <i class="fa-solid fa-gear"></i> Settings
+            </a>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main id="main">
+        <!-- Content will be injected here by app.js -->
+        <div id="content"></div>
+    </main>
+
+    <!-- Scripts -->
+    <script type="module" src="/static/js/app.js"></script>
+</body>
+
+</html>

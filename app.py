@@ -14,6 +14,15 @@ from modules.ml_signal import MLSignalGenerator
 from modules.alert_manager import AlertManager
 from modules.monte_carlo import MonteCarloSimulator
 from modules.webhook_notifier import WebhookNotifier
+from modules.brokers.paper import PaperBrokerAdapter
+from modules.brokers.shioaji import ShioajiBrokerAdapter
+from modules.risk.engine import RiskEngine
+from modules.risk.limits import RiskLimits
+from modules.risk.kill_switch import KillSwitch
+from modules.execution.engine import ExecutionEngine
+from modules.execution.order import OrderRequest, OrderSide, OrderType
+from modules.market.clock import MarketClock
+from config import get_config
 import threading
 import time
 
@@ -32,6 +41,47 @@ ml_signal = MLSignalGenerator()
 alert_manager = AlertManager()
 monte_carlo = MonteCarloSimulator()
 webhook_notifier = WebhookNotifier()
+
+# Initialize Execution Engine & Risk Management
+cfg = get_config()
+_trading_mode = getattr(cfg, "TRADING_MODE", "paper")
+_broker_type = getattr(cfg, "BROKER_TYPE", "paper")
+
+_risk_limits = RiskLimits(
+    max_position_value_per_symbol=getattr(cfg, "RISK_MAX_POSITION_VALUE", 500000.0),
+    max_total_exposure=getattr(cfg, "RISK_MAX_TOTAL_EXPOSURE", 2000000.0),
+    max_order_value=getattr(cfg, "RISK_MAX_ORDER_VALUE", 300000.0),
+    max_open_positions=getattr(cfg, "RISK_MAX_OPEN_POSITIONS", 5),
+    max_trades_per_day=getattr(cfg, "RISK_MAX_TRADES_PER_DAY", 50),
+    max_daily_realized_loss=getattr(cfg, "RISK_MAX_DAILY_REALIZED_LOSS", 50000.0),
+    max_price_deviation_pct=getattr(cfg, "RISK_MAX_PRICE_DEVIATION_PCT", 0.08),
+    max_stale_data_seconds=getattr(cfg, "RISK_MAX_STALE_DATA_SECONDS", 60.0),
+)
+kill_switch = KillSwitch()
+risk_engine = RiskEngine(limits=_risk_limits, kill_switch=kill_switch)
+
+if _broker_type == "shioaji":
+    broker_adapter = ShioajiBrokerAdapter(
+        api_key=getattr(cfg, "SHIOAJI_API_KEY", ""),
+        secret_key=getattr(cfg, "SHIOAJI_SECRET_KEY", ""),
+        cert_path=getattr(cfg, "SHIOAJI_CERT_PATH", ""),
+        cert_password=getattr(cfg, "SHIOAJI_CERT_PASSWORD", ""),
+        person_id=getattr(cfg, "SHIOAJI_PERSON_ID", ""),
+        trading_mode=_trading_mode,
+        simulation=getattr(cfg, "SHIOAJI_SIMULATION", True),
+    )
+else:
+    broker_adapter = PaperBrokerAdapter(
+        initial_cash=getattr(cfg, "PAPER_TRADING_INITIAL_BALANCE", 1000000.0),
+        commission_rate=getattr(cfg, "DEFAULT_FEE_PCT", 0.001425),
+    )
+
+execution_engine = ExecutionEngine(
+    broker=broker_adapter,
+    risk_engine=risk_engine,
+    trading_mode=_trading_mode,
+)
+execution_engine.start(reconcile_on_startup=False)
 
 # Background worker for alerts
 def alert_worker():
@@ -1313,7 +1363,184 @@ def walk_forward_analysis():
         return jsonify({"success": False, "error": str(e)}), 400
 
 
-if __name__ == "__main__":
+# ==================== Event-Driven Execution & Trading APIs ====================
+@app.route("/api/trading/status", methods=["GET"])
+def get_execution_status():
+    """Returns real-time execution engine status, kill switch state, and session info."""
+    try:
+        status = execution_engine.get_status()
+        return jsonify({"success": True, "status": status})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/positions", methods=["GET"])
+def get_execution_positions():
+    """Returns current active positions with cost basis, market value, and unrealized PnL."""
+    try:
+        positions = execution_engine.get_positions()
+        res = {}
+        for sym, p in positions.items():
+            res[sym] = {
+                "symbol": p.symbol,
+                "quantity": p.quantity,
+                "avg_price": p.avg_price,
+                "cost_basis": p.cost_basis,
+                "realized_pnl": p.realized_pnl,
+                "total_commission": p.total_commission,
+                "total_tax": p.total_tax,
+                "last_price": p.last_price,
+                "unrealized_pnl": p.unrealized_pnl(),
+            }
+        return jsonify({"success": True, "positions": res})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/orders", methods=["GET"])
+def get_execution_orders():
+    """Returns open and historical orders tracked by the OMS."""
+    try:
+        all_orders = execution_engine.order_manager.get_all_orders()
+        orders_data = [
+            {
+                "order_id": o.order_id,
+                "broker_order_id": o.broker_order_id,
+                "symbol": o.symbol,
+                "side": o.side.value,
+                "order_type": o.order_type.value,
+                "quantity": o.quantity,
+                "price": o.price,
+                "status": o.status.value,
+                "filled_quantity": o.filled_quantity,
+                "remaining_quantity": o.remaining_quantity,
+                "average_fill_price": o.average_fill_price,
+                "strategy_id": o.strategy_id,
+                "rejection_reason": o.rejection_reason,
+                "created_at": o.created_at.isoformat(),
+            }
+            for o in all_orders
+        ]
+        return jsonify({"success": True, "orders": orders_data})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/pnl", methods=["GET"])
+def get_execution_pnl():
+    """Returns daily realized and unrealized PnL summary and trade count."""
+    try:
+        status = execution_engine.get_status()
+        return jsonify({
+            "success": True,
+            "realized_pnl": status["total_realized_pnl"],
+            "unrealized_pnl": status["total_unrealized_pnl"],
+            "daily_trades": status["daily_trades"],
+            "daily_realized_loss": status["daily_realized_loss"],
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/halt", methods=["POST"])
+def halt_execution():
+    """Emergency trading halt. Triggers global persistent KillSwitch."""
+    data = request.json or {}
+    reason = data.get("reason", "Operator manual halt via API")
+    operator_id = data.get("operator_id", "API_USER")
+    try:
+        execution_engine.risk_engine.kill_switch.halt(reason=reason, operator_id=operator_id)
+        return jsonify({"success": True, "message": "Trading halted successfully", "reason": reason})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/resume", methods=["POST"])
+def resume_execution():
+    """Resumes trading after halt. Requires explicit operator identity and reason."""
+    data = request.json or {}
+    operator_id = data.get("operator_id")
+    reason = data.get("reason", "Resumed via API")
+    if not operator_id:
+        return jsonify({"success": False, "error": "operator_id is required to resume trading"}), 400
+
+    try:
+        execution_engine.risk_engine.kill_switch.resume(operator_id=operator_id, reason=reason)
+        return jsonify({"success": True, "message": "Trading resumed", "operator_id": operator_id})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/order", methods=["POST"])
+def submit_manual_order():
+    """
+    Submits a manual order.
+    MANDATORY: Gated by RiskEngine pre-trade limits before reaching the broker.
+    """
+    data = request.json or {}
+    symbol = data.get("symbol")
+    side_str = data.get("side", "BUY").upper()
+    quantity = int(data.get("quantity", 0))
+    order_type_str = data.get("order_type", "MARKET").upper()
+    price = float(data.get("price", 0.0)) if data.get("price") is not None else None
+
+    if not symbol or quantity <= 0:
+        return jsonify({"success": False, "error": "symbol and positive quantity required"}), 400
+
+    try:
+        side = OrderSide.BUY if side_str == "BUY" else OrderSide.SELL
+        order_type = OrderType.LIMIT if order_type_str == "LIMIT" else OrderType.MARKET
+
+        order_req = OrderRequest(
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            price=price,
+            strategy_id="manual_api",
+        )
+
+        submitted = execution_engine.submit_manual_order(order_req)
+        return jsonify({
+            "success": True,
+            "order": {
+                "order_id": submitted.order_id,
+                "symbol": submitted.symbol,
+                "side": submitted.side.value,
+                "status": submitted.status.value,
+                "rejection_reason": submitted.rejection_reason,
+            }
+        })
+    except PermissionError as pe:
+        return jsonify({"success": False, "error": str(pe)}), 403
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/api/trading/reconcile", methods=["POST"])
+def run_reconciliation():
+    """Executes state reconciliation against authoritative broker state."""
+    try:
+        report = execution_engine.reconcile_with_broker()
+        return jsonify({
+            "success": True,
+            "is_clean": report.is_clean,
+            "critical_count": report.critical_count,
+            "warning_count": report.warning_count,
+            "discrepancies": [
+                {
+                    "type": d.discrepancy_type.value,
+                    "severity": d.severity.value,
+                    "symbol": d.symbol,
+                    "description": d.description,
+                }
+                for d in report.discrepancies
+            ],
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
     os.makedirs("static", exist_ok=True)
     os.makedirs("modules", exist_ok=True)
     os.makedirs("data", exist_ok=True)

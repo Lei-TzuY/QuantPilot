@@ -130,36 +130,77 @@ docker-compose up -d
 
 ---
 
-## 🏗️ 系統架構
+---
+
+## 🛡️ 交易模式與安全規範 (Execution Modes & Safety)
+
+QuantPilot 支援三種執行模式，相同的策略邏輯無需任何修改即可在三種模式間無縫切換：
+
+1. **BACKTEST (歷史回測)**:
+   - 採用嚴格的事件驅動時間語義，徹底杜絕未來資訊洩漏（Look-Ahead Bias）。
+   - Bar $t$ 收盤完成計算特徵並產生訊號後，訂單嚴格於 Bar $t+1$ 起始才具備成交資格。
+2. **PAPER (模擬交易 - 預設模式)**:
+   - 透過 `PaperBrokerAdapter` 進行高真實度即時撮合，完整模擬市價單/限價單、部分成交（Partial Fills）、手續費（0.1425%）、台灣證券交易稅（0.3%）與滑價。
+3. **LIVE (實盤交易 - 嚴格受限)**:
+   - 透過隔離的 `ShioajiBrokerAdapter` 對接永豐金證券（Sinopac Shioaji）。
+
+> [!CAUTION]
+> **重要風險聲明與安全防線 (Risk Disclosure & Safety Invariant):**
+> 1. **實盤交易預設全面鎖定 (Opt-in Only)**：系統預設 `TRADING_MODE=paper`。除非在環境變數中明確設定 `TRADING_MODE=live`，否則任何實盤委託送單將被系統底層直接拒絕拋出異常。
+> 2. **實盤具備虧損風險 (Capital Risk)**：金融量化交易旨在尋求統計優勢，絕無保證獲利。實盤交易可能導致本金損失。
+> 3. **全訂單強制風控閘門 (Risk Engine Gate)**：所有委託單（包括手動 API 下單）在送達券商前，必須通過 `RiskEngine` 前置檢核（單筆金額、總曝險、單檔上限、每日累積虧損、行情資料過期、異常偏離與重覆防護）。
+> 4. **全域緊急熔斷機制 (Kill Switch)**：當日虧損達限或人工觸發時立即進入 `HALTED` 狀態，拒絕所有新委託。熔斷狀態持久化於硬碟，重啟後**絕不自動恢復交易**，必須由指定操作員明確授權恢復。
+
+---
+
+## 🏗️ 事件驅動系統架構 (Event-Driven Architecture)
 
 ```
-QuantPilot 系統架構
-│
-├── API 層 (Flask REST API)
-│   ├── /api/stock/* - 數據端點
-│   ├── /api/analysis/* - 分析端點
-│   ├── /api/backtest/* - 回測端點
-│   ├── /api/ml/* - ML 端點
-│   └── /api/portfolio/* - 組合端點
-│
-├── 業務邏輯層
-│   ├── DataFetcher - 數據獲取
-│   ├── TechnicalAnalyzer - 技術分析
-│   ├── Backtester - 策略回測
-│   ├── ML Engine - ML 引擎
-│   └── PortfolioManager - 組合管理
-│
-├── 機器學習層
-│   ├── FeatureEngineering - 特徵工程
-│   ├── AdvancedMLManager - 模型管理
-│   ├── MLModelManager - 版本控制
-│   └── MLBacktester - ML 回測
-│
-└── 數據層
-    ├── SQLAlchemy ORM
-    ├── 模型存儲
-    └── 緩存 (Redis)
+行情資料 (Market Ticks / Streams)
+       │
+       ▼
+K 線聚合器 BarBuilder (產生 BarEvent)
+       │
+       ▼
+交易策略 Strategy (on_bar -> 發出 SignalEvent)
+       │
+       ▼
+風控引擎 RiskEngine & 緊急熔斷 KillSwitch (輸出 RiskDecision: 允許/拒絕理由)
+       │ (通過)
+       ▼
+訂單管理系統 OrderManager / OMS (生命週期狀態機、唯一 ID、防重覆送單)
+       │
+       ▼
+券商抽象介面 BrokerAdapter
+       ├─────────────────────────────────┐
+       ▼                                 ▼
+模擬券商 PaperBrokerAdapter      台灣永豐 ShioajiBrokerAdapter
+(模擬滑價、稅費、部分成交)        (隔離憑證、Live Mode 嚴格鎖定)
+       │                                 │
+       └────────────────┬────────────────┘
+                        │ 成交回報 (FillEvent) / 委託狀態
+                        ▼
+            部位與委託對帳系統 Reconciler
+            (偵測帳務差異、缺失回報、孤兒委託)
+                        │
+                        ▼
+            狀態持久化與審計日誌 (Crash Recovery & Audit Trail)
 ```
+
+---
+
+## 📡 即時交易與風控 API (Trading APIs)
+
+| 端點 | 方法 | 說明 |
+| :--- | :---: | :--- |
+| `/api/trading/status` | `GET` | 查詢引擎執行狀態、交易模式、市場時段、熔斷狀態、持倉與未實現損益 |
+| `/api/trading/positions` | `GET` | 查詢即時對帳部位、持倉均價、成本與即時浮動盈虧 |
+| `/api/trading/orders` | `GET` | 查詢 OMS 追蹤的所有委託單（進行中、完全成交、已取消、已拒絕） |
+| `/api/trading/pnl` | `GET` | 查詢當日已實現損益、未實現損益與成交筆數 |
+| `/api/trading/order` | `POST` | 手動下單（**強制受 RiskEngine 風控閘門檢驗**，禁止越權） |
+| `/api/trading/halt` | `POST` | 緊急停機熔斷（切換 KillSwitch 至 `HALTED` 並持久化） |
+| `/api/trading/resume` | `POST` | 恢復交易（需填寫 `operator_id` 與授權理由） |
+| `/api/trading/reconcile`| `POST` | 執行內部部位與券商權威帳務的全量對帳 |
 
 ---
 

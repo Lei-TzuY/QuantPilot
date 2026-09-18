@@ -75,6 +75,29 @@ class Config:
     PAPER_TRADING_INITIAL_BALANCE = float(os.getenv("PAPER_TRADING_INITIAL_BALANCE", "1000000"))
     PAPER_TRADING_FEE_PCT = float(os.getenv("PAPER_TRADING_FEE_PCT", "0.001425"))
 
+    # 事件驅動交易架構設定 (Execution Architecture)
+    TRADING_MODE = os.getenv("TRADING_MODE", "paper").lower()  # backtest, paper, live
+    BROKER_TYPE = os.getenv("BROKER_TYPE", "paper").lower()    # paper, shioaji
+    LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "False").lower() == "true"
+
+    # 風險引擎設定 (Risk Engine Defaults)
+    RISK_MAX_POSITION_VALUE = float(os.getenv("RISK_MAX_POSITION_VALUE", "500000"))
+    RISK_MAX_TOTAL_EXPOSURE = float(os.getenv("RISK_MAX_TOTAL_EXPOSURE", "2000000"))
+    RISK_MAX_ORDER_VALUE = float(os.getenv("RISK_MAX_ORDER_VALUE", "300000"))
+    RISK_MAX_OPEN_POSITIONS = int(os.getenv("RISK_MAX_OPEN_POSITIONS", "5"))
+    RISK_MAX_TRADES_PER_DAY = int(os.getenv("RISK_MAX_TRADES_PER_DAY", "50"))
+    RISK_MAX_DAILY_REALIZED_LOSS = float(os.getenv("RISK_MAX_DAILY_REALIZED_LOSS", "50000"))
+    RISK_MAX_PRICE_DEVIATION_PCT = float(os.getenv("RISK_MAX_PRICE_DEVIATION_PCT", "0.08"))
+    RISK_MAX_STALE_DATA_SECONDS = float(os.getenv("RISK_MAX_STALE_DATA_SECONDS", "60.0"))
+
+    # 永豐 Shioaji 券商設定 (Shioaji Broker Settings)
+    SHIOAJI_API_KEY = os.getenv("SHIOAJI_API_KEY", "")
+    SHIOAJI_SECRET_KEY = os.getenv("SHIOAJI_SECRET_KEY", "")
+    SHIOAJI_CERT_PATH = os.getenv("SHIOAJI_CERT_PATH", "")
+    SHIOAJI_CERT_PASSWORD = os.getenv("SHIOAJI_CERT_PASSWORD", "")
+    SHIOAJI_PERSON_ID = os.getenv("SHIOAJI_PERSON_ID", "")
+    SHIOAJI_SIMULATION = os.getenv("SHIOAJI_SIMULATION", "True").lower() == "true"
+
 
 class DevelopmentConfig(Config):
     """開發環境配置"""

@@ -1562,6 +1562,125 @@ def run_reconciliation():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/trading/health", methods=["GET"])
+def get_trading_health():
+    """Returns aggregated system health across broker, market data, and event queue."""
+    try:
+        q_metrics = execution_engine.get_queue_metrics()
+        sup_status = execution_engine.get_supervisor_status()
+        is_halted = execution_engine.risk_engine.kill_switch.is_halted()
+        broker_conn = execution_engine.broker.is_connected()
+
+        data_health = execution_engine.get_data_health()
+        any_degraded = any(h["status"] in ("DEGRADED", "STALE", "DISCONNECTED") for h in data_health.values())
+
+        overall_healthy = broker_conn and not is_halted and q_metrics.is_healthy and not any_degraded
+
+        return jsonify({
+            "success": True,
+            "is_healthy": overall_healthy,
+            "supervisor_state": sup_status["current_state"],
+            "broker_connected": broker_conn,
+            "kill_switch_halted": is_halted,
+            "queue_healthy": q_metrics.is_healthy,
+            "active_symbols_tracked": len(data_health),
+            "data_health_summary": {s: h["status"] for s, h in data_health.items()},
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/session", methods=["GET"])
+def get_trading_session():
+    """Returns lifecycle session details, readiness checklist, and operational state."""
+    try:
+        sup_status = execution_engine.get_supervisor_status()
+        return jsonify({
+            "success": True,
+            "session": sup_status,
+            "trading_mode": execution_engine.trading_mode,
+            "is_running": execution_engine._is_running,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/latency", methods=["GET"])
+def get_trading_latency():
+    """Returns microsecond-accurate latency percentiles (p50, p95, p99) by pipeline stage."""
+    try:
+        snapshot = execution_engine.get_latency_snapshot()
+        stages_res = {
+            stage: {
+                "count": p.count,
+                "mean_ms": p.mean_ms,
+                "p50_ms": p.p50_ms,
+                "p95_ms": p.p95_ms,
+                "p99_ms": p.p99_ms,
+                "min_ms": p.min_ms,
+                "max_ms": p.max_ms,
+            }
+            for stage, p in snapshot.stages.items()
+        }
+        return jsonify({
+            "success": True,
+            "timestamp": snapshot.timestamp.isoformat(),
+            "stages": stages_res,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/data-health", methods=["GET"])
+def get_trading_data_health():
+    """Returns per-symbol market data stream integrity metrics and health states."""
+    try:
+        data_health = execution_engine.get_data_health()
+        return jsonify({
+            "success": True,
+            "data_health": data_health,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/queue", methods=["GET"])
+def get_trading_queue():
+    """Returns streaming market data event queue depth, overflow, and throughput metrics."""
+    try:
+        q_metrics = execution_engine.get_queue_metrics()
+        return jsonify({
+            "success": True,
+            "queue": {
+                "capacity": q_metrics.capacity,
+                "current_depth": q_metrics.current_depth,
+                "max_depth": q_metrics.max_depth,
+                "total_enqueued": q_metrics.total_enqueued,
+                "total_dequeued": q_metrics.total_dequeued,
+                "overflow_count": q_metrics.overflow_count,
+                "dropped_count": q_metrics.dropped_count,
+                "is_healthy": q_metrics.is_healthy,
+            },
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/shadow/report", methods=["GET"])
+def get_trading_shadow_report():
+    """Generates and returns canonical structured Shadow session report (JSON & Markdown)."""
+    try:
+        from dataclasses import asdict
+        report = execution_engine.generate_session_report()
+        return jsonify({
+            "success": True,
+            "report": asdict(report),
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+if __name__ == "__main__":
     os.makedirs("static", exist_ok=True)
     os.makedirs("modules", exist_ok=True)
     os.makedirs("data", exist_ok=True)

@@ -6,9 +6,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 import json
+import logging
 import os
 import threading
 from typing import Optional
+
+logger = logging.getLogger("QuantPilot.KillSwitch")
 
 
 class KillSwitchStatus(str, Enum):
@@ -77,7 +80,7 @@ class KillSwitch:
             self._operator_id = operator_id
             self._updated_at = datetime.now()
             self._save_state()
-            print(f"🚨 [KILL SWITCH ENGAGED] Reason: {reason} by {operator_id or 'System'}")
+            logger.critical(f"[KILL SWITCH ENGAGED] Reason: {reason} by {operator_id or 'System'}")
 
     def resume(self, operator_id: str, reason: str) -> None:
         """Explicit manual resumption requiring operator identity."""
@@ -89,7 +92,7 @@ class KillSwitch:
             self._operator_id = operator_id
             self._updated_at = datetime.now()
             self._save_state()
-            print(f"✅ [KILL SWITCH DISENGAGED] Operator: {operator_id}, Reason: {reason}")
+            logger.info(f"[KILL SWITCH DISENGAGED] Operator: {operator_id}, Reason: {reason}")
 
     def is_halted(self) -> bool:
         with self._lock:

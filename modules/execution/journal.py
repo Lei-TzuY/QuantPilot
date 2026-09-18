@@ -109,12 +109,29 @@ class ExecutionJournal:
     def __init__(self, db_path: str = "data/execution_journal.db"):
         self.db_path = db_path
         self._lock = threading.RLock()
+        self._conn: Optional[sqlite3.Connection] = None
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+        return self._conn
+
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _init_db(self) -> None:
         with self._lock:

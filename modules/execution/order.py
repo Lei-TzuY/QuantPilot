@@ -4,7 +4,7 @@ Order Domain Models and State Machine
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Set
+from typing import Any, List, Optional, Set
 
 
 class OrderSide(str, Enum):
@@ -85,6 +85,7 @@ class Order:
     rejection_reason: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
+    fills: List[Any] = field(default_factory=list)
 
     def __post_init__(self):
         if self.remaining_quantity == 0 and self.status == OrderStatus.NEW:

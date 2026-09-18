@@ -51,10 +51,14 @@ htmlcov/
 
 # Database
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 data/*.csv
 data/*.json
+data/reports/
+data/market/
 !data/.gitkeep
 
 # Models

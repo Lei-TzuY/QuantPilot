@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 import math
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from modules.execution.order import OrderSide
 
@@ -20,7 +20,8 @@ class FeeBreakdown:
     slippage: float
     day_trade_quantity: int
     ordinary_quantity: int
-    tax_rebate: float = 0.0  # For sell-first same-day buy cover adjustments
+    tax_rebate: float = 0.0  # Labeled simulation convenience for intraday cash estimation
+    is_simulation_rebate: bool = False
 
     @property
     def total_cost(self) -> float:
@@ -29,37 +30,306 @@ class FeeBreakdown:
     @property
     def net_cash_impact(self) -> float:
         """Net cash impact of the execution."""
-        # For BUY: cash outflow = -(gross_value + commission + slippage) + tax_rebate
-        # For SELL: cash inflow = (gross_value - commission - tax - slippage)
-        pass
+        return self.gross_value - self.total_cost
 
 
-class TaiwanFeeModel:
+@dataclass
+class TaiwanLot:
+    """Represents an execution lot for tax and clearing settlement."""
+    lot_id: str
+    symbol: str
+    side: OrderSide
+    quantity: int
+    remaining_quantity: int
+    price: float
+    timestamp: datetime
+    is_overnight: bool = False
+
+
+@dataclass(frozen=True)
+class MatchedDayTrade:
+    """A matched same-day offset under Taiwan equity day-trading rules."""
+    symbol: str
+    buy_lot_id: str
+    sell_lot_id: str
+    matched_quantity: int
+    buy_price: float
+    sell_price: float
+    tax_rate: float = 0.0015  # Direct 0.15% statutory tax rate on sell proceeds
+    tax: float = 0.0
+    gross_pnl: float = 0.0
+
+
+@dataclass
+class SettlementReport:
+    """End-of-day or real-time settlement matching report."""
+    trade_date: date
+    symbol: str
+    matched_day_trades: List[MatchedDayTrade] = field(default_factory=list)
+    ordinary_sales: List[TaiwanLot] = field(default_factory=list)
+    remaining_overnight_inventory: List[TaiwanLot] = field(default_factory=list)
+    remaining_intraday_buys: List[TaiwanLot] = field(default_factory=list)
+    total_commission: float = 0.0
+    total_statutory_tax: float = 0.0
+    total_gross_pnl: float = 0.0
+    total_net_pnl: float = 0.0
+
+
+class TaiwanSettlementModel:
     """
-    Centralized Taiwan Equity Fee and Tax Calculator.
+    Deterministic FIFO Matching and Settlement Engine for Taiwan Equities.
     
-    Rules:
-    1. Brokerage Commission:
-       - 0.1425% (0.001425) charged on BOTH Buy and Sell.
-       - Optional broker discount (e.g. 0.6 for 40% discount).
-       - Minimum commission: TWD 20 (configurable).
-    2. Securities Transaction Tax (證券交易稅):
-       - Charged ONLY on SELL transactions.
-       - Ordinary stock sales: 0.3% (0.003).
-       - Qualifying cash-stock day-trading offset (現股當沖): 0.15% (0.0015).
-       - Mutual / ETF funds: 0.1% (0.001) if symbol indicates ETF.
-    3. Day-Trading Offset Rules:
-       - Buy then same-day Sell: The sell quantity up to the same-day bought quantity
-         qualifies for 0.15% tax. The excess sell quantity is taxed at 0.3%.
-       - Sell then same-day Buy: When an intraday short-sell is covered on the same day,
-         the tax difference (0.15%) is rebated.
+    Principles:
+    1. Direct 0.15% Tax: Matched qualifying day-trade quantities have a statutory
+       tax liability of directly 0.15% on the sell proceeds.
+    2. Inventory Separation: Overnight inventory (prior sessions) is tracked strictly
+       separate from same-day intraday executions.
+    3. Deterministic FIFO Matching:
+       - Sales first match available same-day intraday buys (0.15% day-trade rate).
+       - Excess sales match available overnight inventory (0.30% ordinary rate).
+       - Unhedged sales (sell-first day trades) are matched by subsequent same-day buys,
+         with the final settled tax liability directly established at 0.15%.
+    4. Independent Broker Commission: Commission schedules (rates, discounts, min fee)
+       are calculated independently from statutory taxes.
     """
 
     def __init__(
         self,
         commission_rate: float = 0.001425,
         commission_discount: float = 1.0,
-        min_commission: float = 20.0,
+        min_commission: float = 0.0,  # 0.0 TWD default: not all TW brokers enforce 20 TWD minimum
+        ordinary_tax_rate: float = 0.003,
+        day_trade_tax_rate: float = 0.0015,
+        etf_tax_rate: float = 0.001,
+    ):
+        self.commission_rate = commission_rate
+        self.commission_discount = commission_discount
+        self.min_commission = min_commission
+        self.ordinary_tax_rate = ordinary_tax_rate
+        self.day_trade_tax_rate = day_trade_tax_rate
+        self.etf_tax_rate = etf_tax_rate
+
+        self._lock = threading.RLock()
+        self._overnight_pools: Dict[str, List[TaiwanLot]] = {}
+        self._intraday_buys: Dict[str, List[TaiwanLot]] = {}
+        self._intraday_sells: Dict[str, List[TaiwanLot]] = {}
+        self._matched_day_trades: Dict[str, List[MatchedDayTrade]] = {}
+        self._ordinary_sales: Dict[str, List[TaiwanLot]] = {}
+        self._lot_counter = 0
+
+    def _next_lot_id(self, prefix: str = "LOT") -> str:
+        self._lot_counter += 1
+        return f"{prefix}-{self._lot_counter:06d}"
+
+    def _is_etf(self, symbol: str) -> bool:
+        clean = symbol.replace(".TW", "").replace(".TWO", "")
+        return clean.startswith("00")
+
+    def add_overnight_inventory(self, symbol: str, quantity: int, avg_price: float, timestamp: Optional[datetime] = None) -> None:
+        """Seeds overnight inventory carried from prior trading days."""
+        with self._lock:
+            if symbol not in self._overnight_pools:
+                self._overnight_pools[symbol] = []
+            lot = TaiwanLot(
+                lot_id=self._next_lot_id("OVN"),
+                symbol=symbol,
+                side=OrderSide.BUY,
+                quantity=quantity,
+                remaining_quantity=quantity,
+                price=avg_price,
+                timestamp=timestamp or datetime.now(),
+                is_overnight=True,
+            )
+            self._overnight_pools[symbol].append(lot)
+
+    def calculate_commission(self, gross_value: float) -> float:
+        """Calculates broker commission independently from tax."""
+        raw_comm = gross_value * self.commission_rate * self.commission_discount
+        if self.min_commission > 0:
+            return max(self.min_commission, math.floor(raw_comm))
+        return float(math.floor(raw_comm))
+
+    def process_fill(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: int,
+        price: float,
+        timestamp: Optional[datetime] = None,
+    ) -> Tuple[List[MatchedDayTrade], List[TaiwanLot], float, float]:
+        """
+        Processes an intraday fill lot using deterministic FIFO matching.
+        Returns:
+            (new_matched_day_trades, ordinary_sales, commission, immediate_tax)
+        """
+        with self._lock:
+            ts = timestamp or datetime.now()
+            gross_value = quantity * price
+            commission = self.calculate_commission(gross_value)
+            is_etf = self._is_etf(symbol)
+            ord_tax_rate = self.etf_tax_rate if is_etf else self.ordinary_tax_rate
+            dt_tax_rate = self.etf_tax_rate if is_etf else self.day_trade_tax_rate
+
+            if symbol not in self._intraday_buys:
+                self._intraday_buys[symbol] = []
+                self._intraday_sells[symbol] = []
+                self._matched_day_trades[symbol] = []
+                self._ordinary_sales[symbol] = []
+                self._overnight_pools.setdefault(symbol, [])
+
+            new_matches: List[MatchedDayTrade] = []
+            ordinary_sales: List[TaiwanLot] = []
+            tax_liability = 0.0
+
+            if side == OrderSide.BUY:
+                buy_lot = TaiwanLot(
+                    lot_id=self._next_lot_id("BUY"),
+                    symbol=symbol,
+                    side=OrderSide.BUY,
+                    quantity=quantity,
+                    remaining_quantity=quantity,
+                    price=price,
+                    timestamp=ts,
+                    is_overnight=False,
+                )
+
+                # Check if this buy covers existing unhedged intraday short sells (Sell-first day trade)
+                for sell_lot in self._intraday_sells[symbol]:
+                    if sell_lot.remaining_quantity <= 0 or buy_lot.remaining_quantity <= 0:
+                        continue
+                    matched_qty = min(buy_lot.remaining_quantity, sell_lot.remaining_quantity)
+                    # For sell-first day trade, final tax liability for matched portion is DIRECTLY 0.15% on sell proceeds
+                    matched_tax = math.floor(matched_qty * sell_lot.price * dt_tax_rate)
+                    match = MatchedDayTrade(
+                        symbol=symbol,
+                        buy_lot_id=buy_lot.lot_id,
+                        sell_lot_id=sell_lot.lot_id,
+                        matched_quantity=matched_qty,
+                        buy_price=buy_lot.price,
+                        sell_price=sell_lot.price,
+                        tax_rate=dt_tax_rate,
+                        tax=matched_tax,
+                        gross_pnl=matched_qty * (sell_lot.price - buy_lot.price),
+                    )
+                    new_matches.append(match)
+                    self._matched_day_trades[symbol].append(match)
+                    buy_lot.remaining_quantity -= matched_qty
+                    sell_lot.remaining_quantity -= matched_qty
+
+                if buy_lot.remaining_quantity > 0:
+                    self._intraday_buys[symbol].append(buy_lot)
+
+            elif side == OrderSide.SELL:
+                sell_lot = TaiwanLot(
+                    lot_id=self._next_lot_id("SELL"),
+                    symbol=symbol,
+                    side=OrderSide.SELL,
+                    quantity=quantity,
+                    remaining_quantity=quantity,
+                    price=price,
+                    timestamp=ts,
+                    is_overnight=False,
+                )
+
+                # 1. First match against available same-day intraday buys (Buy-then-Sell day trade)
+                for buy_lot in self._intraday_buys[symbol]:
+                    if buy_lot.remaining_quantity <= 0 or sell_lot.remaining_quantity <= 0:
+                        continue
+                    matched_qty = min(sell_lot.remaining_quantity, buy_lot.remaining_quantity)
+                    matched_tax = math.floor(matched_qty * sell_lot.price * dt_tax_rate)
+                    match = MatchedDayTrade(
+                        symbol=symbol,
+                        buy_lot_id=buy_lot.lot_id,
+                        sell_lot_id=sell_lot.lot_id,
+                        matched_quantity=matched_qty,
+                        buy_price=buy_lot.price,
+                        sell_price=sell_lot.price,
+                        tax_rate=dt_tax_rate,
+                        tax=matched_tax,
+                        gross_pnl=matched_qty * (sell_lot.price - buy_lot.price),
+                    )
+                    new_matches.append(match)
+                    self._matched_day_trades[symbol].append(match)
+                    tax_liability += matched_tax
+                    sell_lot.remaining_quantity -= matched_qty
+                    buy_lot.remaining_quantity -= matched_qty
+
+                # 2. Next, match against overnight inventory (Ordinary sale, 0.30% tax)
+                if sell_lot.remaining_quantity > 0:
+                    for ovn_lot in self._overnight_pools[symbol]:
+                        if ovn_lot.remaining_quantity <= 0 or sell_lot.remaining_quantity <= 0:
+                            continue
+                        matched_qty = min(sell_lot.remaining_quantity, ovn_lot.remaining_quantity)
+                        ovn_tax = math.floor(matched_qty * sell_lot.price * ord_tax_rate)
+                        ord_sale = TaiwanLot(
+                            lot_id=sell_lot.lot_id,
+                            symbol=symbol,
+                            side=OrderSide.SELL,
+                            quantity=matched_qty,
+                            remaining_quantity=0,
+                            price=sell_lot.price,
+                            timestamp=ts,
+                            is_overnight=True,
+                        )
+                        ordinary_sales.append(ord_sale)
+                        self._ordinary_sales[symbol].append(ord_sale)
+                        tax_liability += ovn_tax
+                        sell_lot.remaining_quantity -= matched_qty
+                        ovn_lot.remaining_quantity -= matched_qty
+
+                # 3. If shares still remain, this is an unhedged sell (potential sell-first day trade)
+                if sell_lot.remaining_quantity > 0:
+                    self._intraday_sells[symbol].append(sell_lot)
+                    # Provisional ordinary tax estimate (collected by broker until same-day buy cover)
+                    tax_liability += math.floor(sell_lot.remaining_quantity * sell_lot.price * ord_tax_rate)
+
+            return new_matches, ordinary_sales, commission, tax_liability
+
+    def generate_settlement_report(self, symbol: str, trade_date: Optional[date] = None) -> SettlementReport:
+        """Generates the official daily settlement and tax report for a symbol."""
+        with self._lock:
+            dt = trade_date or datetime.now().date()
+            matches = list(self._matched_day_trades.get(symbol, []))
+            ord_sales = list(self._ordinary_sales.get(symbol, []))
+            rem_ovn = [l for l in self._overnight_pools.get(symbol, []) if l.remaining_quantity > 0]
+            rem_buys = [l for l in self._intraday_buys.get(symbol, []) if l.remaining_quantity > 0]
+
+            is_etf = self._is_etf(symbol)
+            ord_tax_rate = self.etf_tax_rate if is_etf else self.ordinary_tax_rate
+
+            # Total statutory tax = (matched day trades * 0.15%) + (ordinary sales * 0.30%)
+            dt_tax = sum(m.tax for m in matches)
+            ord_tax = sum(math.floor(s.quantity * s.price * ord_tax_rate) for s in ord_sales)
+            total_tax = dt_tax + ord_tax
+            gross_pnl = sum(m.gross_pnl for m in matches)
+
+            return SettlementReport(
+                trade_date=dt,
+                symbol=symbol,
+                matched_day_trades=matches,
+                ordinary_sales=ord_sales,
+                remaining_overnight_inventory=rem_ovn,
+                remaining_intraday_buys=rem_buys,
+                total_statutory_tax=total_tax,
+                total_gross_pnl=gross_pnl,
+                total_net_pnl=gross_pnl - total_tax,
+            )
+
+
+class TaiwanFeeModel:
+    """
+    Taiwan Equity Fee and Taxation Model.
+    
+    Provides both:
+    1. Real-time FeeBreakdown for intraday order validation & cash accounting.
+    2. Deterministic TaiwanSettlementModel for FIFO lot matching and direct 0.15% tax clearing.
+    """
+
+    def __init__(
+        self,
+        commission_rate: float = 0.001425,
+        commission_discount: float = 1.0,
+        min_commission: float = 0.0,        # Configurable, default 0.0 (no universal 20 TWD rule)
         ordinary_tax_rate: float = 0.003,
         day_trade_tax_rate: float = 0.0015,
         etf_tax_rate: float = 0.001,
@@ -100,7 +370,9 @@ class TaiwanFeeModel:
 
     def calculate_commission(self, gross_value: float) -> float:
         raw_comm = gross_value * self.commission_rate * self.commission_discount
-        return max(self.min_commission, math.floor(raw_comm))
+        if self.min_commission > 0:
+            return max(self.min_commission, math.floor(raw_comm))
+        return float(math.floor(raw_comm))
 
     def calculate_execution_costs(
         self,
@@ -185,6 +457,7 @@ class TaiwanFeeModel:
                 day_trade_quantity=day_trade_qty,
                 ordinary_quantity=ordinary_qty,
                 tax_rebate=tax_rebate,
+                is_simulation_rebate=(tax_rebate > 0),
             )
 
     def reset_daily_activity(self) -> None:

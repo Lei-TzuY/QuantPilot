@@ -167,7 +167,7 @@ class OrderManager:
             order.filled_quantity = total_filled
             order.remaining_quantity = order.quantity - total_filled
             order.average_fill_price = new_cost / total_filled if total_filled > 0 else 0.0
-
+            order.fills.append(fill)
             self._seen_fill_ids.add(fill.fill_id)
             return order
 

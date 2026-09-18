@@ -36,17 +36,26 @@ class MarketEvent:
 
 @dataclass(frozen=True)
 class TickEvent:
-    timestamp: datetime
+    timestamp: datetime  # Exchange timestamp
     symbol: str
     price: float
     volume: float
     bid_price: Optional[float] = None
     ask_price: Optional[float] = None
+    bid_volume: Optional[float] = None
+    ask_volume: Optional[float] = None
+    receive_timestamp: Optional[datetime] = None
+    enqueue_timestamp: Optional[datetime] = None
+    dequeue_timestamp: Optional[datetime] = None
+    sequence: int = 0
+    tick_type: str = "trade"
+    source: str = "shioaji"
+    simtrade: bool = False
 
 
 @dataclass(frozen=True)
 class BarEvent:
-    timestamp: datetime
+    timestamp: datetime  # Bar finalization timestamp
     symbol: str
     open: float
     high: float
@@ -54,12 +63,18 @@ class BarEvent:
     close: float
     volume: float
     interval: str = "1m"
+    open_time: Optional[datetime] = None
+    close_time: Optional[datetime] = None
 
     def __post_init__(self):
         if self.high < max(self.open, self.close, self.low):
             raise ValueError(f"High price {self.high} cannot be less than open/close/low")
         if self.low > min(self.open, self.close, self.high):
             raise ValueError(f"Low price {self.low} cannot be greater than open/close/high")
+
+    @property
+    def finalize_time(self) -> datetime:
+        return self.timestamp
 
 
 @dataclass(frozen=True)

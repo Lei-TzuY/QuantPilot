@@ -58,6 +58,8 @@ class RiskEngine:
         market_price: Optional[float] = None,
         market_price_timestamp: Optional[datetime] = None,
         current_time: Optional[datetime] = None,
+        strategy_ready: Optional[bool] = None,
+        market_data_healthy: Optional[bool] = None,
     ) -> RiskDecision:
         """
         Pre-trade risk gate. Evaluates an OrderRequest against all configured limits.
@@ -65,6 +67,22 @@ class RiskEngine:
         with self._lock:
             self._check_and_reset_daily_counters()
             eval_time = current_time or datetime.now()
+
+            # 0a. Strategy Warmup Check
+            if strategy_ready is False:
+                return RiskDecision(
+                    allowed=False,
+                    reason=f"STRATEGY_NOT_WARMED_UP: Strategy {request.strategy_id} has not completed historical warmup lookback window",
+                    rule_violated="STRATEGY_NOT_WARMED_UP",
+                )
+
+            # 0b. Market Data Integrity / Health Check
+            if market_data_healthy is False:
+                return RiskDecision(
+                    allowed=False,
+                    reason=f"UNHEALTHY_MARKET_DATA: Market data stream for {request.symbol} is not in HEALTHY state",
+                    rule_violated="UNHEALTHY_MARKET_DATA",
+                )
 
             # 1. Kill Switch Check
             if self.kill_switch.is_halted():

@@ -52,6 +52,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         self._positions: Dict[str, Position] = {}
         self._orders: Dict[str, Order] = {}
         self._latest_prices: Dict[str, float] = {}
+        self._latest_quotes: Dict[str, Dict[str, Optional[float]]] = {}
         self._connected = False
         self._lock = threading.RLock()
         self._counter = 0
@@ -68,12 +69,34 @@ class PaperBrokerAdapter(BrokerAdapter):
     def is_connected(self) -> bool:
         return self._connected
 
-    def set_market_price(self, symbol: str, price: float) -> None:
-        """Injects current market price for realistic simulation."""
+    def set_market_quote(
+        self,
+        symbol: str,
+        price: float,
+        bid_price: Optional[float] = None,
+        ask_price: Optional[float] = None,
+    ) -> None:
+        """
+        Injects top-of-book quote (last trade, best bid, best ask).
+        
+        LIMITATION NOTE:
+        PaperBroker simulates execution using top-of-book best bid/ask quotes.
+        Depth-of-book queue priority (order-book matching queue) is not modeled
+        due to absence of Level 2/3 exchange order-book market feeds.
+        """
         with self._lock:
             self._latest_prices[symbol] = price
-            # Check if any pending limit orders trigger with new price
-            self._check_pending_limit_orders(symbol, price)
+            self._latest_quotes[symbol] = {
+                "last": price,
+                "bid": bid_price,
+                "ask": ask_price,
+            }
+            # Check if any pending limit orders trigger with new quote
+            self._check_pending_limit_orders(symbol, price, bid_price, ask_price)
+
+    def set_market_price(self, symbol: str, price: float) -> None:
+        """Backwards-compatible market price injection."""
+        self.set_market_quote(symbol, price=price)
 
     def get_account(self) -> Dict[str, Any]:
         with self._lock:
@@ -134,8 +157,19 @@ class PaperBrokerAdapter(BrokerAdapter):
             order.transition_to(OrderStatus.SUBMITTED)
             self._notify_order(order)
 
-            # Determine execution reference price
-            ref_price = self._latest_prices.get(order.symbol, order.price)
+            # Determine execution reference price taking top-of-book quotes into account
+            quote = self._latest_quotes.get(order.symbol, {})
+            last_p = self._latest_prices.get(order.symbol, order.price)
+            bid_p = quote.get("bid")
+            ask_p = quote.get("ask")
+
+            if order.side == OrderSide.BUY:
+                # Market BUY order executes against Ask when available
+                ref_price = ask_p if (ask_p is not None and ask_p > 0) else last_p
+            else:
+                # Market SELL order executes against Bid when available
+                ref_price = bid_p if (bid_p is not None and bid_p > 0) else last_p
+
             if ref_price is None or ref_price <= 0:
                 order.transition_to(OrderStatus.REJECTED, reason=f"NO_MARKET_PRICE_FOR_{order.symbol}")
                 self._notify_order(order)
@@ -187,9 +221,9 @@ class PaperBrokerAdapter(BrokerAdapter):
 
         # Apply slippage
         if order.side == OrderSide.BUY:
-            exec_price = base_price * (1.0 + self.slippage_pct)
+            exec_price = round(base_price * (1.0 + self.slippage_pct), 2)
         else:
-            exec_price = base_price * (1.0 - self.slippage_pct)
+            exec_price = round(base_price * (1.0 - self.slippage_pct), 2)
 
         fill_qty = order.remaining_quantity
         if self.enable_partial_fills and order.remaining_quantity > 1:
@@ -249,15 +283,39 @@ class PaperBrokerAdapter(BrokerAdapter):
 
         self._notify_order(order)
 
-    def _check_pending_limit_orders(self, symbol: str, price: float) -> None:
-        """Evaluates pending limit orders against new price."""
+    def _check_pending_limit_orders(
+        self,
+        symbol: str,
+        price: float,
+        bid_price: Optional[float] = None,
+        ask_price: Optional[float] = None,
+    ) -> None:
+        """Evaluates pending limit orders against top-of-book bid/ask quotes and traded price."""
         for order in list(self._orders.values()):
             if order.symbol == symbol and order.status in {OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED}:
                 if order.order_type == OrderType.LIMIT and order.price is not None:
-                    if order.side == OrderSide.BUY and price <= order.price:
-                        self._execute_fill(order, price)
-                    elif order.side == OrderSide.SELL and price >= order.price:
-                        self._execute_fill(order, price)
+                    if order.side == OrderSide.BUY:
+                        # Executable ask or trade price reaches or crosses limit
+                        exec_ref = ask_price if (ask_price is not None and ask_price > 0) else price
+                        if exec_ref <= order.price:
+                            self._execute_fill(order, exec_ref)
+                    elif order.side == OrderSide.SELL:
+                        # Executable bid or trade price reaches or crosses limit
+                        exec_ref = bid_price if (bid_price is not None and bid_price > 0) else price
+                        if exec_ref >= order.price:
+                            self._execute_fill(order, exec_ref)
+
+    def _process_open_orders(self, symbol: str) -> None:
+        """Convenience alias to re-evaluate open orders against current market quote."""
+        with self._lock:
+            quote = self._latest_quotes.get(symbol, {})
+            price = self._latest_prices.get(symbol, 0.0)
+            self._check_pending_limit_orders(
+                symbol=symbol,
+                price=price,
+                bid_price=quote.get("bid"),
+                ask_price=quote.get("ask"),
+            )
 
     def cancel_order(self, order_id: str) -> bool:
         with self._lock:
@@ -277,6 +335,15 @@ class PaperBrokerAdapter(BrokerAdapter):
                 self._notify_order(order)
                 return True
             return False
+
+    def get_order(self, order_id: str) -> Optional[Order]:
+        with self._lock:
+            order = self._orders.get(order_id)
+            if not order:
+                for o in self._orders.values():
+                    if o.broker_order_id == order_id:
+                        return o
+            return order
 
     def subscribe_market_data(self, symbols: List[str]) -> None:
         pass

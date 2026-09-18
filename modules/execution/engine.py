@@ -33,6 +33,12 @@ from modules.execution.reconciliation import Reconciler, ReconciliationReport
 from modules.execution.journal import ExecutionJournal
 from modules.market.bar_builder import BarBuilder
 from modules.market.clock import MarketClock
+from modules.market.event_queue import MarketDataEventQueue, QueueMetrics
+from modules.market.integrity import MarketDataIntegrityChecker, MarketHealthStatus
+from modules.market.recorder import RawMarketDataRecorder
+from modules.monitoring.latency import LatencySnapshot, LatencyTracker
+from modules.monitoring.session_report import ShadowSessionReporter, ShadowSessionData
+from modules.execution.supervisor import ShadowSessionSupervisor, SupervisorState
 from modules.risk.engine import RiskEngine
 from modules.risk.kill_switch import KillSwitch
 from modules.strategy.base import BaseStrategy
@@ -57,6 +63,13 @@ class ExecutionEngine:
         bar_builder: Optional[BarBuilder] = None,
         trading_mode: str = "paper",
         default_order_shares: int = 1000,  # Standard Taiwan round lot: 1,000 shares
+        event_queue: Optional[MarketDataEventQueue] = None,
+        integrity_checker: Optional[MarketDataIntegrityChecker] = None,
+        recorder: Optional[RawMarketDataRecorder] = None,
+        latency_tracker: Optional[LatencyTracker] = None,
+        supervisor: Optional[ShadowSessionSupervisor] = None,
+        reporter: Optional[ShadowSessionReporter] = None,
+        synchronous_queue: bool = True,
     ):
         self.trading_mode = trading_mode.lower()
         self.broker = broker
@@ -68,6 +81,18 @@ class ExecutionEngine:
         self.journal = journal or ExecutionJournal()
         self.bar_builder = bar_builder or BarBuilder(interval_seconds=60)
         self.default_order_shares = default_order_shares
+
+        # Production-Safety & Observability Subsystems
+        self.event_queue = event_queue or MarketDataEventQueue(
+            capacity=10_000,
+            synchronous=synchronous_queue,
+            name="ShadowEventQueue",
+        )
+        self.integrity_checker = integrity_checker or MarketDataIntegrityChecker()
+        self.recorder = recorder
+        self.latency_tracker = latency_tracker or LatencyTracker()
+        self.supervisor = supervisor or ShadowSessionSupervisor()
+        self.reporter = reporter or ShadowSessionReporter()
 
         self._positions: Dict[str, Position] = {}
         self._strategies: Dict[str, BaseStrategy] = {}
@@ -83,14 +108,69 @@ class ExecutionEngine:
         # Hook BarBuilder callback to engine's on_bar
         self.bar_builder.register_bar_callback(self.on_bar)
 
-    def on_tick(self, tick: TickEvent) -> Optional[BarEvent]:
+        # Wire event queue subscriber & overflow handler
+        self.event_queue.subscribe(self._process_dequeued_tick)
+        self.event_queue.on_overflow = self._on_queue_overflow
+
+    def _on_queue_overflow(self, tick: TickEvent, metrics: QueueMetrics) -> None:
+        """Handles queue overflow incident: mark data unhealthy and halt entries."""
+        logger.critical(f"Queue overflow detected for {tick.symbol}! Capacity={metrics.capacity}, dropped={metrics.dropped_count}")
+        self.integrity_checker.record_incident(tick.symbol, "QUEUE_OVERFLOW")
+        self.supervisor.trigger_degraded(f"EventQueue overflow: {metrics.dropped_count} ticks dropped")
+
+    def on_tick(self, tick: TickEvent) -> bool:
         """
-        Receives normalized market quote tick, updates BarBuilder, and triggers on_bar on bar completion.
+        Ultra-lightweight market data quote callback.
+        Normalizes tick with enqueue timestamp and pushes to bounded event queue.
+        Returns immediately without blocking or computing downstream logic.
         """
         with self._lock:
             if not self._is_running:
-                return None
-            return self.bar_builder.on_tick_event(tick)
+                return False
+        return self.event_queue.enqueue(tick)
+
+    def _process_dequeued_tick(self, tick: TickEvent) -> None:
+        """
+        Consumes dequeued tick from event queue:
+        1. Measure queue and network latencies
+        2. Validate tick against integrity invariants
+        3. Persist raw tick in Parquet recorder
+        4. Update broker top-of-book bid/ask quotes
+        5. Aggregate into 1-minute BarBuilder
+        """
+        with self._lock:
+            if not self._is_running:
+                return
+
+            # 1. Latency tracking
+            self.latency_tracker.record_tick_latencies(
+                exchange_ts=tick.timestamp,
+                receive_ts=tick.receive_timestamp,
+                enqueue_ts=tick.enqueue_timestamp,
+                dequeue_ts=tick.dequeue_timestamp or datetime.now(),
+            )
+
+            # 2. Market-data integrity check
+            is_valid, rejection_reason = self.integrity_checker.validate_tick(tick)
+            if not is_valid:
+                logger.warning(f"Integrity check rejected tick for {tick.symbol}: {rejection_reason}")
+                return
+
+            # 3. Raw tick recorder (buffered, append-only)
+            if self.recorder:
+                self.recorder.record_tick(tick)
+
+            # 4. Bid/Ask top-of-book awareness for paper execution
+            if isinstance(self.broker, PaperBrokerAdapter):
+                self.broker.set_market_quote(
+                    symbol=tick.symbol,
+                    price=tick.price,
+                    bid_price=tick.bid_price,
+                    ask_price=tick.ask_price,
+                )
+
+            # 5. Bar aggregation
+            self.bar_builder.on_tick_event(tick)
 
     def connect_market_data(self, quote_source: Any) -> None:
         """
@@ -124,16 +204,24 @@ class ExecutionEngine:
 
     def start(self, reconcile_on_startup: bool = True) -> bool:
         """
-        Starts the execution engine.
-        Restores state from durable journal -> queries broker -> reconciles -> halts on discrepancy -> permits trading.
+        Starts the execution engine with full ShadowSessionSupervisor lifecycle management:
+        INITIALIZING -> CONNECTING -> SYNCING -> READY -> RUNNING.
+        Enforces institutional checklists before permitting order flow.
         """
         with self._lock:
+            # Lifecycle: INITIALIZING
+            if self.supervisor.current_state != SupervisorState.INITIALIZING:
+                self.supervisor.transition_to(SupervisorState.INITIALIZING, "Starting execution engine")
+
             # 1. Connect broker
+            self.supervisor.transition_to(SupervisorState.CONNECTING, "Connecting broker adapter")
             if not self.broker.is_connected():
                 self.broker.connect()
+            self.supervisor.update_checklist(broker_connected=self.broker.is_connected())
 
             # 2. Restore state from durable journal first (crash-safe)
             if self.journal:
+                self.supervisor.update_checklist(journal_available=True)
                 journal_state = self.journal.restore_state()
                 if journal_state and journal_state.get("orders"):
                     seen_fill_ids = {f.fill_id for f in journal_state.get("fills", [])}
@@ -151,11 +239,11 @@ class ExecutionEngine:
                 if journal_state and journal_state.get("is_halted"):
                     self.risk_engine.kill_switch.halt(
                         reason="Restored HALTED state from durable execution journal",
-                        operator_id="JOURNAL_RECOVERY"
+                        operator_id="JOURNAL_RECOVERY",
                     )
 
-            # Fallback to JSON snapshot if journal was empty
-            if not self._positions:
+            # Fallback to JSON snapshot only if no durable journal is configured
+            if not self.journal and not self._positions:
                 saved = self.persistence.load_state()
                 if saved:
                     self._positions = saved["positions"]
@@ -165,24 +253,60 @@ class ExecutionEngine:
                             self.order_manager._broker_order_map[ord_obj.broker_order_id] = ord_obj.order_id
 
             # 3. Reconcile with authoritative broker state
+            self.supervisor.transition_to(SupervisorState.SYNCING, "Reconciling state with broker")
+            reconciliation_clean = True
             if reconcile_on_startup:
                 report = self.reconcile_with_broker()
                 if not report.is_clean and report.critical_count > 0:
+                    reconciliation_clean = False
                     logger.critical(f"Critical reconciliation mismatch on startup: {report.discrepancies}")
                     self.risk_engine.kill_switch.halt(
                         reason=f"CRITICAL_STARTUP_RECONCILIATION_MISMATCH: {report.critical_count} critical issues",
                         operator_id="RECONCILER",
                     )
+            self.supervisor.update_checklist(reconciliation_clean=reconciliation_clean)
 
+            # 4. Strategy warmup status & Risk status
+            all_warmed_up = all(s.strategy_ready for s in self._strategies.values()) if self._strategies else True
+            self.supervisor.update_checklist(
+                strategies_warmed_up=all_warmed_up,
+                risk_engine_ready=True,
+                kill_switch_active=self.risk_engine.kill_switch.is_halted(),
+                market_clock_valid=True,
+            )
+
+            # 5. Check readiness and transition to RUNNING
+            if self.supervisor.can_transition_to(SupervisorState.READY):
+                self.supervisor.transition_to(SupervisorState.READY, "Preconditions satisfied")
+                if self.supervisor.can_transition_to(SupervisorState.RUNNING):
+                    self.supervisor.transition_to(SupervisorState.RUNNING, "Starting trading loop")
+
+            # 6. Start queue worker and set running flag
+            self.event_queue.start()
             self._is_running = True
             self._log_event(EventType.SYSTEM, {"action": "START", "trading_mode": self.trading_mode})
             return True
 
     def stop(self) -> None:
         with self._lock:
+            if self.supervisor.current_state in (
+                SupervisorState.RUNNING,
+                SupervisorState.DEGRADED,
+                SupervisorState.HALTED,
+                SupervisorState.READY,
+            ):
+                self.supervisor.transition_to(SupervisorState.CLOSING, "Stopping execution engine")
+
+            self.event_queue.stop(drain=True)
+            if self.recorder:
+                self.recorder.close()
+
             self._is_running = False
             self._persist_current_state()
             self._log_event(EventType.SYSTEM, {"action": "STOP"})
+
+            if self.supervisor.current_state == SupervisorState.CLOSING:
+                self.supervisor.transition_to(SupervisorState.CLOSED, "Execution engine stopped")
 
     def _persist_current_state(self) -> None:
         all_orders = self.order_manager.get_all_orders()
@@ -198,7 +322,7 @@ class ExecutionEngine:
 
     def on_bar(self, bar: BarEvent) -> None:
         """
-        Processes a completed bar event.
+        Processes a completed, immutable 1-minute bar event.
         Dispatches to strategies, routes signals to RiskEngine, and submits approved orders.
         """
         with self._lock:
@@ -224,18 +348,41 @@ class ExecutionEngine:
             if isinstance(self.broker, PaperBrokerAdapter):
                 self.broker.set_market_price(bar.symbol, bar.close)
 
+            # Verify market data integrity status
+            data_healthy = self.integrity_checker.is_symbol_healthy(bar.symbol)
+            if not data_healthy:
+                health_status = self.integrity_checker.get_health(bar.symbol)
+                logger.warning(
+                    f"Market data for {bar.symbol} is {health_status.value}. Strategy entry signals will be rejected by RiskEngine."
+                )
+
             # Evaluate registered strategies
             for strat_id, strategy in self._strategies.items():
                 try:
+                    t_strat_start = datetime.now()
                     signal = strategy.on_bar(bar)
-                    if signal:
-                        self._process_signal(signal, bar)
-                except Exception as e:
-                    logger.error(f"Strategy {strat_id} failed on_bar: {e}")
+                    t_strat_ms = (datetime.now() - t_strat_start).total_seconds() * 1000.0
+                    self.latency_tracker.record_stage_latency("strategy", t_strat_ms)
 
-    def _process_signal(self, signal: SignalEvent, bar: BarEvent) -> Optional[Order]:
+                    if signal:
+                        self._process_signal(
+                            signal=signal,
+                            bar=bar,
+                            strategy_ready=strategy.strategy_ready,
+                            market_data_healthy=data_healthy,
+                        )
+                except Exception as e:
+                    logger.error(f"Strategy {strat_id} failed on_bar: {e}", exc_info=True)
+
+    def _process_signal(
+        self,
+        signal: SignalEvent,
+        bar: BarEvent,
+        strategy_ready: bool = True,
+        market_data_healthy: bool = True,
+    ) -> Optional[Order]:
         """
-        Processes a SignalEvent through RiskEngine and OMS.
+        Processes a SignalEvent through RiskEngine and OMS with full safety validation.
         """
         self._log_event(
             EventType.SIGNAL,
@@ -283,14 +430,19 @@ class ExecutionEngine:
             signal_id=signal.signal_id,
         )
 
-        # Evaluate against RiskEngine
+        # Evaluate against RiskEngine with latency instrumentation
+        t_risk_start = datetime.now()
         decision = self.risk_engine.evaluate_order(
             request=request,
             current_positions=self._positions,
             market_price=bar.close,
             market_price_timestamp=bar.timestamp,
             current_time=bar.timestamp,
+            strategy_ready=strategy_ready,
+            market_data_healthy=market_data_healthy,
         )
+        t_risk_ms = (datetime.now() - t_risk_start).total_seconds() * 1000.0
+        self.latency_tracker.record_stage_latency("risk_evaluation", t_risk_ms)
 
         if self.journal:
             self.journal.record_risk_decision(
@@ -354,8 +506,16 @@ class ExecutionEngine:
             correlation_id=order.order_id,
         )
 
-        # Submit to BrokerAdapter
+        # Submit to BrokerAdapter with latency tracking
+        t_exec_start = datetime.now()
         updated_order = self.broker.submit_order(order)
+        t_exec_ms = (datetime.now() - t_exec_start).total_seconds() * 1000.0
+        self.latency_tracker.record_stage_latency("execution", t_exec_ms)
+
+        # Record end-to-end signal latency
+        e2e_ms = (datetime.now() - bar.timestamp).total_seconds() * 1000.0
+        self.latency_tracker.record_stage_latency("end_to_end", e2e_ms)
+
         self._persist_current_state()
         return updated_order
 
@@ -548,6 +708,8 @@ class ExecutionEngine:
             kill_status = self.risk_engine.kill_switch.get_status()
             market_session = self.market_clock.get_session()
             broker_acc = self.broker.get_account()
+            q_metrics = self.event_queue.get_metrics()
+            sup_report = self.supervisor.get_status_report()
 
             total_unrealized_pnl = sum(
                 p.unrealized_pnl(self._latest_bars[p.symbol].close if p.symbol in self._latest_bars else None)
@@ -558,6 +720,7 @@ class ExecutionEngine:
             return {
                 "running": self._is_running,
                 "trading_mode": self.trading_mode,
+                "supervisor_state": sup_report["current_state"],
                 "market_session": market_session.value,
                 "kill_switch": {
                     "status": kill_status.status.value,
@@ -570,5 +733,107 @@ class ExecutionEngine:
                 "daily_realized_loss": self.risk_engine._daily_realized_loss,
                 "total_realized_pnl": total_realized_pnl,
                 "total_unrealized_pnl": total_unrealized_pnl,
+                "queue": {
+                    "depth": q_metrics.current_depth,
+                    "max_depth": q_metrics.max_depth,
+                    "overflow_count": q_metrics.overflow_count,
+                    "dropped_count": q_metrics.dropped_count,
+                    "is_healthy": q_metrics.is_healthy,
+                },
                 "broker": broker_acc,
             }
+
+    def generate_session_report(self, session_date: Optional[str] = None) -> ShadowSessionData:
+        """
+        Gathers comprehensive end-of-session telemetry and writes JSON and Markdown reports.
+        """
+        with self._lock:
+            symbols = list(set(list(self._latest_bars.keys()) + list(self._positions.keys())))
+            if not symbols:
+                symbols = ["2330"]
+
+            all_orders = self.order_manager.get_all_orders()
+            orders_submitted = len(all_orders)
+            orders_filled = len([o for o in all_orders if o.status == OrderStatus.FILLED])
+            orders_rejected = len([o for o in all_orders if o.status == OrderStatus.REJECTED])
+            orders_cancelled = len([o for o in all_orders if o.status == OrderStatus.CANCELLED])
+
+            total_fills = sum(len(getattr(o, "fills", [])) for o in all_orders)
+            total_realized_pnl = sum(p.realized_pnl for p in self._positions.values())
+
+            total_comm = sum(sum(f.commission for f in getattr(o, "fills", [])) for o in all_orders)
+            total_tax = sum(sum(f.tax for f in getattr(o, "fills", [])) for o in all_orders)
+            total_slippage = sum(sum(getattr(f, "slippage", 0.0) for f in getattr(o, "fills", [])) for o in all_orders)
+
+            q_metrics = self.event_queue.get_metrics()
+            lat_snapshot = self.latency_tracker.get_snapshot()
+
+            now = datetime.now()
+            start_time = self._latest_bars[symbols[0]].timestamp if (symbols and symbols[0] in self._latest_bars) else now
+
+            data_health_incidents = sum(
+                h.duplicate_count + h.out_of_order_count + h.stale_count + h.price_anomaly_count
+                for h in self.integrity_checker.get_all_reports().values()
+            )
+
+            report = self.reporter.build_report(
+                session_id=self.supervisor.session_id,
+                symbols=symbols,
+                start_time=start_time,
+                end_time=now,
+                ticks_received=q_metrics.total_enqueued,
+                ticks_valid=q_metrics.total_dequeued,
+                ticks_rejected=q_metrics.dropped_count,
+                bars_count=len(self._latest_bars),
+                signals_count=len([e for e in self._audit_log if e.event_type == EventType.SIGNAL]),
+                risk_approvals=len([e for e in self._audit_log if e.event_type == EventType.ORDER_SUBMITTED]),
+                risk_rejections=len([e for e in self._audit_log if e.event_type == EventType.RISK_REJECTED]),
+                orders_submitted=orders_submitted,
+                orders_filled=orders_filled,
+                orders_rejected=orders_rejected,
+                orders_cancelled=orders_cancelled,
+                total_fills=total_fills,
+                gross_pnl=total_realized_pnl + total_comm + total_tax + total_slippage,
+                commission=total_comm,
+                tax=total_tax,
+                slippage=total_slippage,
+                max_drawdown_pct=0.0,
+                queue_max_depth=q_metrics.max_depth,
+                queue_overflow_count=q_metrics.overflow_count,
+                disconnect_count=sum(h.reconnect_gaps_count for h in self.integrity_checker.get_all_reports().values()),
+                reconciliation_count=len([e for e in self._audit_log if e.event_type == EventType.SYSTEM and e.payload.get("action") == "RECONCILIATION"]),
+                kill_switch_events=1 if self.risk_engine.kill_switch.is_halted() else 0,
+                data_health_incidents=data_health_incidents,
+                exceptions_count=0,
+                latency_snapshot=lat_snapshot,
+            )
+            self.reporter.persist_report(report)
+            return report
+
+    def get_latency_snapshot(self) -> LatencySnapshot:
+        return self.latency_tracker.get_snapshot()
+
+    def get_data_health(self) -> Dict[str, Any]:
+        return {
+            s: {
+                "status": h.status.value,
+                "last_price": h.last_price,
+                "last_sequence": h.last_sequence,
+                "total_ticks_received": h.total_ticks_received,
+                "total_ticks_valid": h.total_ticks_valid,
+                "total_ticks_rejected": h.total_ticks_rejected,
+                "duplicate_count": h.duplicate_count,
+                "out_of_order_count": h.out_of_order_count,
+                "stale_count": h.stale_count,
+                "price_anomaly_count": h.price_anomaly_count,
+                "reconnect_gaps_count": h.reconnect_gaps_count,
+                "last_anomaly_reason": h.last_anomaly_reason,
+            }
+            for s, h in self.integrity_checker.get_all_reports().items()
+        }
+
+    def get_queue_metrics(self) -> QueueMetrics:
+        return self.event_queue.get_metrics()
+
+    def get_supervisor_status(self) -> Dict[str, Any]:
+        return self.supervisor.get_status_report()

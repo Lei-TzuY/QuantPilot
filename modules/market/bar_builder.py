@@ -5,7 +5,7 @@ Aggregates ticks into standardized OHLCV BarEvents.
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
-from modules.execution.events import BarEvent
+from modules.execution.events import BarEvent, TickEvent
 
 
 class BarBuilder:
@@ -27,6 +27,15 @@ class BarBuilder:
                 cb(bar)
             except Exception as e:
                 print(f"Error in bar callback: {e}")
+
+    def on_tick_event(self, tick: TickEvent) -> Optional[BarEvent]:
+        """Processes normalized TickEvent."""
+        return self.on_tick(
+            symbol=tick.symbol,
+            price=tick.price,
+            volume=tick.volume,
+            timestamp=tick.timestamp,
+        )
 
     def on_tick(self, symbol: str, price: float, volume: float, timestamp: datetime) -> Optional[BarEvent]:
         """Processes incoming tick. Emits completed BarEvent if bar interval rolled over."""

@@ -22,6 +22,7 @@ from modules.risk.kill_switch import KillSwitch
 from modules.execution.engine import ExecutionEngine
 from modules.execution.order import OrderRequest, OrderSide, OrderType
 from modules.market.clock import MarketClock
+from modules.execution.auth import TradingControlAuth, require_control_auth
 from config import get_config
 import threading
 import time
@@ -1196,6 +1197,8 @@ def backtest_ml_strategy():
         # Align price data with predictions
         price_df = df.loc[features_df.index]
         
+        execution_timing = payload.get("execution_timing", "next_bar_open")
+        
         # Run backtest
         backtester_ml = MLBacktester()
         result = backtester_ml.backtest_ml_strategy(
@@ -1203,7 +1206,8 @@ def backtest_ml_strategy():
             predictions,
             probabilities if probabilities is not None else np.zeros((len(predictions), 2)),
             initial_capital=initial_capital,
-            confidence_threshold=confidence_threshold
+            confidence_threshold=confidence_threshold,
+            execution_timing=execution_timing
         )
         
         return jsonify({
@@ -1443,11 +1447,12 @@ def get_execution_pnl():
 
 
 @app.route("/api/trading/halt", methods=["POST"])
+@require_control_auth
 def halt_execution():
     """Emergency trading halt. Triggers global persistent KillSwitch."""
     data = request.json or {}
     reason = data.get("reason", "Operator manual halt via API")
-    operator_id = data.get("operator_id", "API_USER")
+    operator_id = data.get("operator_id", "API_OPERATOR")
     try:
         execution_engine.risk_engine.kill_switch.halt(reason=reason, operator_id=operator_id)
         return jsonify({"success": True, "message": "Trading halted successfully", "reason": reason})
@@ -1456,13 +1461,20 @@ def halt_execution():
 
 
 @app.route("/api/trading/resume", methods=["POST"])
+@require_control_auth
 def resume_execution():
-    """Resumes trading after halt. Requires explicit operator identity and reason."""
+    """Resumes trading after halt. Requires explicit operator identity, confirmation, and reason."""
     data = request.json or {}
     operator_id = data.get("operator_id")
-    reason = data.get("reason", "Resumed via API")
-    if not operator_id:
-        return jsonify({"success": False, "error": "operator_id is required to resume trading"}), 400
+    confirmation = data.get("confirmation")
+    reason = data.get("reason")
+    if not operator_id or not reason:
+        return jsonify({"success": False, "error": "operator_id and reason are required to resume trading"}), 400
+    if confirmation != "CONFIRM_RESUME":
+        return jsonify({
+            "success": False,
+            "error": "Explicit confirmation required. Send confirmation='CONFIRM_RESUME' to resume trading."
+        }), 400
 
     try:
         execution_engine.risk_engine.kill_switch.resume(operator_id=operator_id, reason=reason)
@@ -1472,11 +1484,19 @@ def resume_execution():
 
 
 @app.route("/api/trading/order", methods=["POST"])
+@require_control_auth
 def submit_manual_order():
     """
     Submits a manual order.
     MANDATORY: Gated by RiskEngine pre-trade limits before reaching the broker.
+    Disabled by default in LIVE mode unless ENABLE_MANUAL_LIVE_ORDERS=true.
     """
+    if TradingControlAuth.get_trading_mode() == "live" and not TradingControlAuth.is_manual_live_order_enabled():
+        return jsonify({
+            "success": False,
+            "error": "Arbitrary manual order submission is disabled in LIVE trading mode. Set ENABLE_MANUAL_LIVE_ORDERS=true to permit."
+        }), 403
+
     data = request.json or {}
     symbol = data.get("symbol")
     side_str = data.get("side", "BUY").upper()
@@ -1518,6 +1538,7 @@ def submit_manual_order():
 
 
 @app.route("/api/trading/reconcile", methods=["POST"])
+@require_control_auth
 def run_reconciliation():
     """Executes state reconciliation against authoritative broker state."""
     try:

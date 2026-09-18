@@ -23,6 +23,7 @@ from modules.execution.order import (
     OrderStatus,
     OrderType,
 )
+from modules.execution.journal import ExecutionJournal
 from modules.execution.order_manager import OrderManager
 from modules.execution.persistence import ExecutionStatePersistence
 from modules.execution.position import Position
@@ -58,6 +59,7 @@ class TestExecutionPlatform(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.kill_switch_file = os.path.join(self.test_dir, "kill_switch.json")
         self.state_file = os.path.join(self.test_dir, "execution_state.json")
+        self.journal_file = os.path.join(self.test_dir, "test_journal.db")
 
         self.kill_switch = KillSwitch(state_file=self.kill_switch_file)
         self.limits = RiskLimits(
@@ -82,6 +84,7 @@ class TestExecutionPlatform(unittest.TestCase):
         self.broker.connect()
         self.order_manager = OrderManager(duplicate_window_seconds=2.0)
         self.persistence = ExecutionStatePersistence(storage_path=self.state_file)
+        self.journal = ExecutionJournal(db_path=self.journal_file)
         self.reconciler = Reconciler()
         self.market_clock = MarketClock()
 
@@ -91,6 +94,7 @@ class TestExecutionPlatform(unittest.TestCase):
             order_manager=self.order_manager,
             market_clock=self.market_clock,
             persistence=self.persistence,
+            journal=self.journal,
             reconciler=self.reconciler,
             trading_mode="paper",
             default_order_shares=1000,
@@ -565,8 +569,11 @@ class TestExecutionPlatform(unittest.TestCase):
         res = client.post("/api/trading/resume", json={"reason": "Test Resume"})
         self.assertEqual(res.status_code, 400)
 
-        # Resume with operator_id succeeds
-        res = client.post("/api/trading/resume", json={"reason": "Test Resume", "operator_id": "TEST_OP"})
+        # Resume with operator_id and confirmation succeeds
+        res = client.post(
+            "/api/trading/resume",
+            json={"reason": "Test Resume", "operator_id": "TEST_OP", "confirmation": "CONFIRM_RESUME"},
+        )
         self.assertEqual(res.status_code, 200)
         self.assertTrue(res.get_json()["success"])
 

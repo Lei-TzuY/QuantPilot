@@ -10,6 +10,7 @@ from modules.brokers.base import BrokerAdapter
 from modules.execution.order import Order, OrderSide, OrderStatus, OrderType, TimeInForce
 from modules.execution.fills import Fill
 from modules.execution.position import Position
+from modules.execution.events import TickEvent
 
 # Check if shioaji is installed
 try:
@@ -56,9 +57,18 @@ class ShioajiBrokerAdapter(BrokerAdapter):
         self._account = None
         self._positions_cache: Dict[str, Position] = {}
         self._orders_cache: Dict[str, Order] = {}
+        self._tick_callbacks: List[Callable[[TickEvent], None]] = []
 
     def connect(self) -> bool:
         """Authenticates and initializes Shioaji session."""
+        if self.trading_mode == "live":
+            if not self.api_key or not self.secret_key:
+                raise ValueError(
+                    "Shioaji credentials missing. Provide SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY via environment."
+                )
+            if not SHIOAJI_AVAILABLE:
+                raise RuntimeError("Cannot operate in live mode: shioaji library is not installed.")
+
         if not SHIOAJI_AVAILABLE:
             # When Shioaji library is not present (e.g. CI or mock env)
             print("Notice: shioaji package not installed. Operating in mock/isolated adapter mode.")
@@ -173,12 +183,13 @@ class ShioajiBrokerAdapter(BrokerAdapter):
     def submit_order(self, order: Order) -> Order:
         """
         Submits order to Shioaji.
-        STRICT LIVE GUARD: Live execution is unconditionally blocked unless TRADING_MODE='live'.
+        STRICT LIVE GUARD: Live execution is unconditionally blocked unless TRADING_MODE='live' and ENABLE_LIVE_TRADING='true'.
         """
-        if self.trading_mode != "live":
+        enable_live = os.getenv("ENABLE_LIVE_TRADING", "false").strip().lower() in ("true", "1", "yes")
+        if self.trading_mode != "live" or not enable_live:
             order.transition_to(
                 OrderStatus.REJECTED,
-                reason="LIVE_TRADING_DISABLED: Configuration flag TRADING_MODE must be explicitly set to 'live'",
+                reason="LIVE_TRADING_DISABLED: Both TRADING_MODE='live' and ENABLE_LIVE_TRADING='true' must be explicitly configured.",
             )
             self._notify_order(order)
             return order
@@ -260,6 +271,45 @@ class ShioajiBrokerAdapter(BrokerAdapter):
                     self._api.quote.subscribe(contract, quote_type=sj_const.QuoteType.Tick)
             except Exception as e:
                 print(f"Error subscribing to {s}: {e}")
+
+    def register_tick_callback(self, callback: Callable[[TickEvent], None]) -> None:
+        """Registers listener for normalized real-time quote ticks."""
+        self._tick_callbacks.append(callback)
+
+    def _notify_tick(self, tick: TickEvent) -> None:
+        for cb in self._tick_callbacks:
+            try:
+                cb(tick)
+            except Exception as e:
+                print(f"Error in tick callback: {e}")
+
+    def simulate_tick(self, tick: TickEvent) -> None:
+        """Emits a normalized TickEvent to registered listeners (for shadow/replay mode)."""
+        self._notify_tick(tick)
+
+    def _on_shioaji_tick(self, exchange: str, tick: Any) -> None:
+        """Normalizes native Shioaji quote tick to domain TickEvent."""
+        try:
+            code = str(getattr(tick, "code", ""))
+            price = float(getattr(tick, "close", getattr(tick, "price", 0.0)))
+            vol = float(getattr(tick, "volume", getattr(tick, "vol", 0.0)))
+            bid = float(getattr(tick, "bid_price", 0.0)) if hasattr(tick, "bid_price") else None
+            ask = float(getattr(tick, "ask_price", 0.0)) if hasattr(tick, "ask_price") else None
+            ts = getattr(tick, "ts", None) or getattr(tick, "datetime", None) or datetime.now()
+            if not isinstance(ts, datetime):
+                ts = datetime.now()
+
+            tick_event = TickEvent(
+                timestamp=ts,
+                symbol=code,
+                price=price,
+                volume=vol,
+                bid_price=bid,
+                ask_price=ask,
+            )
+            self._notify_tick(tick_event)
+        except Exception as e:
+            print(f"Error parsing Shioaji tick: {e}")
 
     def unsubscribe_market_data(self, symbols: List[str]) -> None:
         pass

@@ -15,6 +15,7 @@ from modules.execution.events import (
     EventType,
     RiskDecision,
     SignalEvent,
+    TickEvent,
 )
 from modules.execution.fills import Fill
 from modules.execution.order import (
@@ -29,6 +30,8 @@ from modules.execution.order_manager import OrderManager
 from modules.execution.persistence import ExecutionStatePersistence
 from modules.execution.position import Position
 from modules.execution.reconciliation import Reconciler, ReconciliationReport
+from modules.execution.journal import ExecutionJournal
+from modules.market.bar_builder import BarBuilder
 from modules.market.clock import MarketClock
 from modules.risk.engine import RiskEngine
 from modules.risk.kill_switch import KillSwitch
@@ -50,6 +53,8 @@ class ExecutionEngine:
         market_clock: Optional[MarketClock] = None,
         persistence: Optional[ExecutionStatePersistence] = None,
         reconciler: Optional[Reconciler] = None,
+        journal: Optional[ExecutionJournal] = None,
+        bar_builder: Optional[BarBuilder] = None,
         trading_mode: str = "paper",
         default_order_shares: int = 1000,  # Standard Taiwan round lot: 1,000 shares
     ):
@@ -60,6 +65,8 @@ class ExecutionEngine:
         self.market_clock = market_clock or MarketClock()
         self.persistence = persistence or ExecutionStatePersistence()
         self.reconciler = reconciler or Reconciler()
+        self.journal = journal or ExecutionJournal()
+        self.bar_builder = bar_builder or BarBuilder(interval_seconds=60)
         self.default_order_shares = default_order_shares
 
         self._positions: Dict[str, Position] = {}
@@ -72,6 +79,28 @@ class ExecutionEngine:
         # Hook broker callbacks
         self.broker.register_order_callback(self._on_broker_order_update)
         self.broker.register_fill_callback(self._on_broker_fill)
+
+        # Hook BarBuilder callback to engine's on_bar
+        self.bar_builder.register_bar_callback(self.on_bar)
+
+    def on_tick(self, tick: TickEvent) -> Optional[BarEvent]:
+        """
+        Receives normalized market quote tick, updates BarBuilder, and triggers on_bar on bar completion.
+        """
+        with self._lock:
+            if not self._is_running:
+                return None
+            return self.bar_builder.on_tick_event(tick)
+
+    def connect_market_data(self, quote_source: Any) -> None:
+        """
+        Connects an external market data feed (e.g. Shioaji quote feed) to the internal BarBuilder.
+        Enables SHADOW MODE: Real market data feeding Paper execution.
+        """
+        with self._lock:
+            if hasattr(quote_source, "register_tick_callback"):
+                quote_source.register_tick_callback(self.on_tick)
+                logger.info("Connected market data feed to ExecutionEngine BarBuilder (Shadow Mode active).")
 
     def register_strategy(self, strategy: BaseStrategy) -> None:
         with self._lock:
@@ -96,30 +125,53 @@ class ExecutionEngine:
     def start(self, reconcile_on_startup: bool = True) -> bool:
         """
         Starts the execution engine.
-        Ensures broker connection, restores persisted state, and performs reconciliation.
+        Restores state from durable journal -> queries broker -> reconciles -> halts on discrepancy -> permits trading.
         """
         with self._lock:
             # 1. Connect broker
             if not self.broker.is_connected():
                 self.broker.connect()
 
-            # 2. Restore state from persistence
-            saved = self.persistence.load_state()
-            if saved:
-                self._positions = saved["positions"]
-                for ord_obj in saved["orders"]:
-                    self.order_manager._orders[ord_obj.order_id] = ord_obj
-                    if ord_obj.broker_order_id:
-                        self.order_manager._broker_order_map[ord_obj.broker_order_id] = ord_obj.order_id
+            # 2. Restore state from durable journal first (crash-safe)
+            if self.journal:
+                journal_state = self.journal.restore_state()
+                if journal_state and journal_state.get("orders"):
+                    seen_fill_ids = {f.fill_id for f in journal_state.get("fills", [])}
+                    self.order_manager.load_state(journal_state["orders"], seen_fill_ids=seen_fill_ids)
+
+                    # Reconstruct positions from journal fills
+                    rebuilt_positions: Dict[str, Position] = {}
+                    for fill in journal_state.get("fills", []):
+                        if fill.symbol not in rebuilt_positions:
+                            rebuilt_positions[fill.symbol] = Position(symbol=fill.symbol)
+                        rebuilt_positions[fill.symbol].apply_fill(fill)
+                    self._positions = {s: p for s, p in rebuilt_positions.items() if p.quantity > 0}
+
+                # If journal records trading was HALTED, retain halt on startup
+                if journal_state and journal_state.get("is_halted"):
+                    self.risk_engine.kill_switch.halt(
+                        reason="Restored HALTED state from durable execution journal",
+                        operator_id="JOURNAL_RECOVERY"
+                    )
+
+            # Fallback to JSON snapshot if journal was empty
+            if not self._positions:
+                saved = self.persistence.load_state()
+                if saved:
+                    self._positions = saved["positions"]
+                    for ord_obj in saved["orders"]:
+                        self.order_manager._orders[ord_obj.order_id] = ord_obj
+                        if ord_obj.broker_order_id:
+                            self.order_manager._broker_order_map[ord_obj.broker_order_id] = ord_obj.order_id
 
             # 3. Reconcile with authoritative broker state
             if reconcile_on_startup:
                 report = self.reconcile_with_broker()
                 if not report.is_clean and report.critical_count > 0:
                     logger.critical(f"Critical reconciliation mismatch on startup: {report.discrepancies}")
-                    # Safety: halt trading if critical discrepancies detected
                     self.risk_engine.kill_switch.halt(
-                        reason=f"CRITICAL_STARTUP_RECONCILIATION_MISMATCH: {report.critical_count} critical issues"
+                        reason=f"CRITICAL_STARTUP_RECONCILIATION_MISMATCH: {report.critical_count} critical issues",
+                        operator_id="RECONCILER",
                     )
 
             self._is_running = True
@@ -240,6 +292,16 @@ class ExecutionEngine:
             current_time=bar.timestamp,
         )
 
+        if self.journal:
+            self.journal.record_risk_decision(
+                decision_id=f"RISK-{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
+                timestamp=datetime.now(),
+                order_id=signal.signal_id or "SIGNAL_ORDER",
+                approved=decision.allowed,
+                reason=decision.reason or "",
+                metrics_snapshot=getattr(decision, "metrics_snapshot", {}),
+            )
+
         if not decision.allowed:
             self._log_event(
                 EventType.RISK_REJECTED,
@@ -267,6 +329,19 @@ class ExecutionEngine:
                 message=str(e),
             )
             return None
+
+        if self.journal:
+            self.journal.record_order_request(
+                order_id=order.order_id,
+                timestamp=order.created_at,
+                symbol=order.symbol,
+                side=order.side.value,
+                order_type=order.order_type.value,
+                quantity=order.quantity,
+                price=order.price,
+                strategy_id=order.strategy_id,
+                signal_id=order.signal_id,
+            )
 
         self._log_event(
             EventType.ORDER_SUBMITTED,
@@ -298,10 +373,34 @@ class ExecutionEngine:
                 market_price_timestamp=datetime.now(),
             )
 
+            if self.journal:
+                self.journal.record_risk_decision(
+                    decision_id=f"RISK-{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
+                    timestamp=datetime.now(),
+                    order_id="MANUAL_ORDER",
+                    approved=decision.allowed,
+                    reason=decision.reason or "",
+                    metrics_snapshot=getattr(decision, "metrics_snapshot", {}),
+                )
+
             if not decision.allowed:
                 raise PermissionError(f"Manual order rejected by RiskEngine: {decision.reason}")
 
             order = self.order_manager.create_order(request)
+
+            if self.journal:
+                self.journal.record_order_request(
+                    order_id=order.order_id,
+                    timestamp=order.created_at,
+                    symbol=order.symbol,
+                    side=order.side.value,
+                    order_type=order.order_type.value,
+                    quantity=order.quantity,
+                    price=order.price,
+                    strategy_id=order.strategy_id,
+                    signal_id=order.signal_id,
+                )
+
             submitted_order = self.broker.submit_order(order)
             self._persist_current_state()
             return submitted_order
@@ -313,6 +412,16 @@ class ExecutionEngine:
     def _on_broker_order_update(self, order: Order) -> None:
         """Handles order lifecycle updates from broker."""
         with self._lock:
+            if self.journal:
+                self.journal.record_order_transition(
+                    order_id=order.order_id,
+                    timestamp=order.updated_at,
+                    from_status="BROKER_UPDATE",
+                    to_status=order.status.value,
+                    broker_order_id=order.broker_order_id,
+                    reason=order.rejection_reason or "",
+                )
+
             self._log_event(
                 EventType.ORDER_ACCEPTED if order.status == OrderStatus.ACCEPTED else EventType.SYSTEM,
                 {"order_id": order.order_id, "status": order.status.value, "reason": order.rejection_reason},
@@ -339,7 +448,11 @@ class ExecutionEngine:
             # 3. Notify RiskEngine
             self.risk_engine.record_trade_execution(realized_pnl)
 
-            # 4. Audit log
+            # 4. Durable journal record
+            if self.journal:
+                self.journal.record_fill(fill)
+
+            # 5. Audit log
             self._log_event(
                 EventType.FILL,
                 {
@@ -361,6 +474,7 @@ class ExecutionEngine:
     def reconcile_with_broker(self) -> ReconciliationReport:
         """
         Executes full state reconciliation between internal state and broker authoritative state.
+        Authoritative broker state is primary for LIVE mode.
         """
         with self._lock:
             broker_positions = self.broker.get_positions()
@@ -374,6 +488,36 @@ class ExecutionEngine:
                 broker_open_orders=broker_open_orders,
             )
 
+            # Reconcile harmless differences:
+            # If broker has order that is ACCEPTED but internally still SUBMITTED
+            brk_by_id = {o.broker_order_id or o.order_id: o for o in broker_open_orders}
+            for int_ord in internal_open_orders:
+                if int_ord.status == OrderStatus.SUBMITTED and int_ord.broker_order_id in brk_by_id:
+                    brk_ord = brk_by_id[int_ord.broker_order_id]
+                    if brk_ord.status == OrderStatus.ACCEPTED:
+                        self.order_manager.record_acceptance(int_ord.order_id, int_ord.broker_order_id)
+
+            # Halt immediately on critical discrepancies
+            if report.critical_count > 0:
+                logger.critical(
+                    f"Authoritative reconciliation detected {report.critical_count} critical mismatches! Triggering emergency halt."
+                )
+                self.risk_engine.kill_switch.halt(
+                    reason=f"Authoritative reconciliation mismatch: {report.critical_count} critical discrepancies detected.",
+                    operator_id="RECONCILER",
+                )
+
+            # Record in journal
+            if self.journal:
+                self.journal.record_reconciliation(
+                    event_id=f"REC-{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
+                    timestamp=datetime.now(),
+                    is_clean=report.is_clean,
+                    critical_count=report.critical_count,
+                    warning_count=report.warning_count,
+                    details={"discrepancies": [d.description for d in report.discrepancies]},
+                )
+
             self._log_event(
                 EventType.SYSTEM,
                 {
@@ -385,6 +529,15 @@ class ExecutionEngine:
             )
 
             return report
+
+    def on_broker_reconnect(self) -> ReconciliationReport:
+        """
+        Called upon broker reconnection.
+        Freezes submissions, queries broker state, reconciles, and halts on critical mismatch.
+        """
+        with self._lock:
+            logger.info("Broker reconnected. Executing authoritative state reconciliation...")
+            return self.reconcile_with_broker()
 
     def get_positions(self) -> Dict[str, Position]:
         with self._lock:

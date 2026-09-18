@@ -26,12 +26,14 @@ class MLBacktester:
         initial_capital: float = 1_000_000,
         confidence_threshold: float = 0.6,
         fee_rate: float = 0.001425,
+        tax_rate: float = 0.003,
         slippage_pct: float = 0.001,
         stop_loss_pct: float = 0.05,
-        take_profit_pct: float = 0.10
+        take_profit_pct: float = 0.10,
+        execution_timing: str = "next_bar_open"
     ) -> Dict:
         """
-        使用ML預測進行回測
+        使用ML預測進行回測 (支援無未來資訊的次根K棒開盤價撮合)
         
         Args:
             df: 價格數據
@@ -39,14 +41,25 @@ class MLBacktester:
             probabilities: 預測概率 [prob_sell, prob_buy]
             initial_capital: 初始資金
             confidence_threshold: 信心閾值
-            fee_rate: 手續費率
+            fee_rate: 手續費率 (預設 0.1425%)
+            tax_rate: 證券交易稅率 (預設 0.3%)
             slippage_pct: 滑價百分比
             stop_loss_pct: 止損百分比
             take_profit_pct: 止盈百分比
+            execution_timing: 'next_bar_open' (預設，無未來資訊) 或 'same_bar_close' (已棄用)
         
         Returns:
             回測結果
         """
+        import warnings
+        if execution_timing == "same_bar_close":
+            warnings.warn(
+                "same_bar_close execution retains same-bar look-ahead bias. "
+                "Defaulting to next_bar_open is recommended for realistic backtesting.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         # 重置
         self.trades = []
         self.equity_curve = []
@@ -60,27 +73,28 @@ class MLBacktester:
         if len(df) != len(predictions):
             raise ValueError("Data and predictions length mismatch")
         
+        pending_action = None
+        pending_reason = None
+        pending_confidence = 0.0
+
         # 逐日回測
         for i in range(len(df)):
             date = df.index[i] if isinstance(df.index, pd.DatetimeIndex) else i
             price = df['close'].iloc[i]
+            open_price = df['open'].iloc[i] if 'open' in df.columns else price
             pred = predictions[i]
             prob = probabilities[i]
-            
-            # 獲取預測信心度
             confidence = max(prob)
             
-            # 如果有持倉，檢查止損止盈
-            if position > 0:
-                # 計算收益率
-                pnl_pct = (price - entry_price) / entry_price
-                
-                # 止損
-                if pnl_pct <= -stop_loss_pct:
-                    sell_price = price * (1 - slippage_pct)
+            # 1. 執行來自前一根K棒的委託 (next_bar_open 模式)
+            if execution_timing == "next_bar_open" and pending_action is not None:
+                if pending_action == "sell" and position > 0:
+                    sell_price = open_price * (1 - slippage_pct)
                     sell_value = position * sell_price
                     fee = sell_value * fee_rate
-                    capital += sell_value - fee
+                    tax = sell_value * tax_rate
+                    capital += sell_value - fee - tax
+                    pnl_pct = (sell_price - entry_price) / entry_price if entry_price > 0 else 0
                     
                     self.trades.append({
                         'entry_date': entry_date,
@@ -88,76 +102,134 @@ class MLBacktester:
                         'entry_price': entry_price,
                         'exit_price': sell_price,
                         'shares': position,
-                        'pnl': sell_value - position * entry_price - fee,
+                        'fee': fee,
+                        'tax': tax,
+                        'pnl': sell_value - position * entry_price - fee - tax,
                         'pnl_pct': pnl_pct * 100,
-                        'exit_reason': 'stop_loss'
+                        'exit_reason': pending_reason or 'ml_signal',
+                        'confidence': pending_confidence
                     })
-                    
                     position = 0
                     entry_price = 0
                     entry_date = None
-                
-                # 止盈
-                elif pnl_pct >= take_profit_pct:
-                    sell_price = price * (1 - slippage_pct)
-                    sell_value = position * sell_price
-                    fee = sell_value * fee_rate
-                    capital += sell_value - fee
-                    
-                    self.trades.append({
-                        'entry_date': entry_date,
-                        'exit_date': date,
-                        'entry_price': entry_price,
-                        'exit_price': sell_price,
-                        'shares': position,
-                        'pnl': sell_value - position * entry_price - fee,
-                        'pnl_pct': pnl_pct * 100,
-                        'exit_reason': 'take_profit'
-                    })
-                    
-                    position = 0
-                    entry_price = 0
-                    entry_date = None
-                
-                # ML預測賣出信號
-                elif pred == 0 and confidence >= confidence_threshold:
-                    sell_price = price * (1 - slippage_pct)
-                    sell_value = position * sell_price
-                    fee = sell_value * fee_rate
-                    capital += sell_value - fee
-                    
-                    self.trades.append({
-                        'entry_date': entry_date,
-                        'exit_date': date,
-                        'entry_price': entry_price,
-                        'exit_price': sell_price,
-                        'shares': position,
-                        'pnl': sell_value - position * entry_price - fee,
-                        'pnl_pct': pnl_pct * 100,
-                        'exit_reason': 'ml_signal',
-                        'confidence': confidence
-                    })
-                    
-                    position = 0
-                    entry_price = 0
-                    entry_date = None
-            
-            # 如果沒有持倉且ML預測買入
-            elif position == 0 and pred == 1 and confidence >= confidence_threshold:
-                buy_price = price * (1 + slippage_pct)
-                shares_to_buy = int(capital * 0.95 / buy_price)  # 使用95%的資金
-                
-                if shares_to_buy > 0:
-                    cost = shares_to_buy * buy_price
-                    fee = cost * fee_rate
-                    total_cost = cost + fee
-                    
-                    if total_cost <= capital:
-                        capital -= total_cost
-                        position = shares_to_buy
-                        entry_price = buy_price
-                        entry_date = date
-            
+                    pending_action = None
+
+                elif pending_action == "buy" and position == 0:
+                    buy_price = open_price * (1 + slippage_pct)
+                    shares_to_buy = int(capital * 0.95 / buy_price)
+                    if shares_to_buy > 0:
+                        cost = shares_to_buy * buy_price
+                        fee = cost * fee_rate
+                        total_cost = cost + fee
+                        if total_cost <= capital:
+                            capital -= total_cost
+                            position = shares_to_buy
+                            entry_price = buy_price
+                            entry_date = date
+                    pending_action = None
+
+            # 2. 評估當前K棒信號
+            if execution_timing == "next_bar_open":
+                if position > 0:
+                    pnl_pct = (price - entry_price) / entry_price
+                    if pnl_pct <= -stop_loss_pct:
+                        pending_action = "sell"
+                        pending_reason = "stop_loss"
+                        pending_confidence = confidence
+                    elif pnl_pct >= take_profit_pct:
+                        pending_action = "sell"
+                        pending_reason = "take_profit"
+                        pending_confidence = confidence
+                    elif pred == 0 and confidence >= confidence_threshold:
+                        pending_action = "sell"
+                        pending_reason = "ml_signal"
+                        pending_confidence = confidence
+                elif position == 0 and pred == 1 and confidence >= confidence_threshold:
+                    pending_action = "buy"
+                    pending_reason = "ml_signal"
+                    pending_confidence = confidence
+
+            else:
+                # 舊版 same_bar_close 執行模式 (保留向後相容性，但已棄用)
+                if position > 0:
+                    pnl_pct = (price - entry_price) / entry_price
+                    if pnl_pct <= -stop_loss_pct:
+                        sell_price = price * (1 - slippage_pct)
+                        sell_value = position * sell_price
+                        fee = sell_value * fee_rate
+                        tax = sell_value * tax_rate
+                        capital += sell_value - fee - tax
+                        self.trades.append({
+                            'entry_date': entry_date,
+                            'exit_date': date,
+                            'entry_price': entry_price,
+                            'exit_price': sell_price,
+                            'shares': position,
+                            'fee': fee,
+                            'tax': tax,
+                            'pnl': sell_value - position * entry_price - fee - tax,
+                            'pnl_pct': pnl_pct * 100,
+                            'exit_reason': 'stop_loss'
+                        })
+                        position = 0
+                        entry_price = 0
+                        entry_date = None
+                    elif pnl_pct >= take_profit_pct:
+                        sell_price = price * (1 - slippage_pct)
+                        sell_value = position * sell_price
+                        fee = sell_value * fee_rate
+                        tax = sell_value * tax_rate
+                        capital += sell_value - fee - tax
+                        self.trades.append({
+                            'entry_date': entry_date,
+                            'exit_date': date,
+                            'entry_price': entry_price,
+                            'exit_price': sell_price,
+                            'shares': position,
+                            'fee': fee,
+                            'tax': tax,
+                            'pnl': sell_value - position * entry_price - fee - tax,
+                            'pnl_pct': pnl_pct * 100,
+                            'exit_reason': 'take_profit'
+                        })
+                        position = 0
+                        entry_price = 0
+                        entry_date = None
+                    elif pred == 0 and confidence >= confidence_threshold:
+                        sell_price = price * (1 - slippage_pct)
+                        sell_value = position * sell_price
+                        fee = sell_value * fee_rate
+                        tax = sell_value * tax_rate
+                        capital += sell_value - fee - tax
+                        self.trades.append({
+                            'entry_date': entry_date,
+                            'exit_date': date,
+                            'entry_price': entry_price,
+                            'exit_price': sell_price,
+                            'shares': position,
+                            'fee': fee,
+                            'tax': tax,
+                            'pnl': sell_value - position * entry_price - fee - tax,
+                            'pnl_pct': pnl_pct * 100,
+                            'exit_reason': 'ml_signal',
+                            'confidence': confidence
+                        })
+                        position = 0
+                        entry_price = 0
+                        entry_date = None
+                elif position == 0 and pred == 1 and confidence >= confidence_threshold:
+                    buy_price = price * (1 + slippage_pct)
+                    shares_to_buy = int(capital * 0.95 / buy_price)
+                    if shares_to_buy > 0:
+                        cost = shares_to_buy * buy_price
+                        fee = cost * fee_rate
+                        total_cost = cost + fee
+                        if total_cost <= capital:
+                            capital -= total_cost
+                            position = shares_to_buy
+                            entry_price = buy_price
+                            entry_date = date
+
             # 記錄資產曲線
             current_value = capital
             if position > 0:
@@ -170,14 +242,14 @@ class MLBacktester:
                 'position_value': position * price if position > 0 else 0
             })
         
-        # 如果最後還有持倉，平倉
+        # 如果最後還有持倉，以最後收盤價平倉結算
         if position > 0:
             final_price = df['close'].iloc[-1]
             sell_value = position * final_price
             fee = sell_value * fee_rate
-            capital += sell_value - fee
-            
-            pnl_pct = (final_price - entry_price) / entry_price
+            tax = sell_value * tax_rate
+            capital += sell_value - fee - tax
+            pnl_pct = (final_price - entry_price) / entry_price if entry_price > 0 else 0
             
             self.trades.append({
                 'entry_date': entry_date,
@@ -185,7 +257,9 @@ class MLBacktester:
                 'entry_price': entry_price,
                 'exit_price': final_price,
                 'shares': position,
-                'pnl': sell_value - position * entry_price - fee,
+                'fee': fee,
+                'tax': tax,
+                'pnl': sell_value - position * entry_price - fee - tax,
                 'pnl_pct': pnl_pct * 100,
                 'exit_reason': 'final_close'
             })

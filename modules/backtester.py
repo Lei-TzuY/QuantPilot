@@ -126,6 +126,7 @@ class Backtester:
         # Fee and slippage tracking
         total_commission = 0.0
         total_slippage = 0.0
+        total_tax = 0.0
 
         # Risk parameters
         stop_loss_pct = float(risk_params.get("stop_loss_pct", 0)) if risk_params else 0
@@ -133,19 +134,87 @@ class Backtester:
         position_size_pct = float(risk_params.get("position_size_pct", 1.0)) if risk_params else 1.0
         
         # Fee parameters (Taiwan stock market defaults)
-        commission_rate = float(risk_params.get("commission_rate", 0.001425)) if risk_params else 0.001425  # 0.1425%
-        tax_rate = float(risk_params.get("tax_rate", 0.003)) if risk_params else 0.003  # 0.3% sell tax
-        slippage_pct = float(risk_params.get("slippage_pct", 0.001)) if risk_params else 0.001  # 0.1% slippage
+        commission_rate = float(risk_params.get("commission_rate", 0.001425)) if risk_params else 0.001425
+        tax_rate = float(risk_params.get("tax_rate", 0.003)) if risk_params else 0.003
+        slippage_pct = float(risk_params.get("slippage_pct", 0.001)) if risk_params else 0.001
+
+        # Execution timing: "next_bar_open" (default, realistic, zero look-ahead) vs "same_bar_close" (deprecated)
+        execution_timing = risk_params.get("execution_timing", "next_bar_open") if risk_params else "next_bar_open"
+        if execution_timing == "same_bar_close":
+            import warnings
+            warnings.warn(
+                "same_bar_close execution retains same-bar look-ahead bias. "
+                "Defaulting to next_bar_open is recommended for realistic backtesting.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        pending_action = None
 
         for date, row in df.iterrows():
             price = float(row["close"])
             high = float(row.get("high", price))
             low = float(row.get("low", price))
             open_price = float(row.get("open", price))
-            
             signal = int(row["signal"])
-            
-            # 1. Check Risk Exits (Stop Loss / Take Profit) FIRST
+
+            # 1. Execute Pending Order from previous bar at current bar's Open (t+1 execution)
+            if execution_timing == "next_bar_open" and pending_action is not None:
+                if pending_action == "buy" and position == 0:
+                    allocatable_cash = cash * position_size_pct
+                    exec_price = open_price * (1 + slippage_pct)
+                    shares = int(allocatable_cash // exec_price)
+                    if shares > 0:
+                        gross_cost = shares * exec_price
+                        commission = gross_cost * commission_rate
+                        slippage_cost = shares * open_price * slippage_pct
+                        total_cost = gross_cost + commission
+                        cash -= total_cost
+                        position += shares
+                        entry_price = exec_price
+                        total_commission += commission
+                        total_slippage += slippage_cost
+                        trades.append({
+                            "type": "buy",
+                            "date": date.strftime("%Y-%m-%d"),
+                            "price": exec_price,
+                            "market_price": open_price,
+                            "shares": shares,
+                            "commission": round(commission, 2),
+                            "slippage": round(slippage_cost, 2),
+                            "cash_after": cash,
+                            "reason": "Signal (t+1 Open)",
+                        })
+                elif pending_action == "sell" and position > 0:
+                    exec_price = open_price * (1 - slippage_pct)
+                    gross_proceeds = position * exec_price
+                    commission = gross_proceeds * commission_rate
+                    tax = gross_proceeds * tax_rate
+                    slippage_cost = position * open_price * slippage_pct
+                    net_proceeds = gross_proceeds - commission - tax
+                    cash += net_proceeds
+                    trade_pnl = (exec_price - entry_price) * position - commission - tax
+                    total_commission += commission
+                    total_tax += tax
+                    total_slippage += slippage_cost
+                    trades.append({
+                        "type": "sell",
+                        "date": date.strftime("%Y-%m-%d"),
+                        "price": exec_price,
+                        "market_price": open_price,
+                        "shares": position,
+                        "commission": round(commission, 2),
+                        "tax": round(tax, 2),
+                        "slippage": round(slippage_cost, 2),
+                        "cash_after": cash,
+                        "reason": "Signal (t+1 Open)",
+                        "pnl": round(trade_pnl, 2),
+                    })
+                    position = 0
+                    entry_price = 0.0
+                pending_action = None
+
+            # 2. Check Risk Exits (Stop Loss / Take Profit) on current bar
             if position > 0:
                 exit_price = None
                 exit_reason = ""
@@ -154,7 +223,6 @@ class Backtester:
                 if stop_loss_pct > 0:
                     sl_price = entry_price * (1 - stop_loss_pct)
                     if low <= sl_price:
-                        # Gap down check: if open is already below SL, we exit at Open
                         exit_price = open_price if open_price < sl_price else sl_price
                         exit_reason = "Stop Loss"
 
@@ -162,13 +230,18 @@ class Backtester:
                 if take_profit_pct > 0 and exit_price is None:
                     tp_price = entry_price * (1 + take_profit_pct)
                     if high >= tp_price:
-                        # Gap up check
                         exit_price = open_price if open_price > tp_price else tp_price
                         exit_reason = "Take Profit"
                 
                 if exit_price is not None:
                     proceeds = position * exit_price
-                    cash += proceeds
+                    commission = proceeds * commission_rate
+                    tax = proceeds * tax_rate
+                    net_proceeds = proceeds - commission - tax
+                    cash += net_proceeds
+                    trade_pnl = (exit_price - entry_price) * position - commission - tax
+                    total_commission += commission
+                    total_tax += tax
                     trades.append({
                         "type": "sell",
                         "date": date.strftime("%Y-%m-%d"),
@@ -176,87 +249,67 @@ class Backtester:
                         "shares": position,
                         "cash_after": cash,
                         "reason": exit_reason,
-                        "pnl": (exit_price - entry_price) * position
+                        "pnl": round(trade_pnl, 2),
                     })
                     position = 0
                     entry_price = 0.0
 
-            # 2. Check Signals (Entry/Exit)
-            # Only enter if we have cash and no position (assuming simple 1 shot strategy for now)
-            # Or if signal flips from -1 to 1 (reversal)
-            
-            if position == 0 and signal == 1:
-                # Buy Logic
-                # Position Sizing
-                allocatable_cash = cash * position_size_pct
-                
-                # Apply slippage to execution price (buy at higher price)
-                exec_price = price * (1 + slippage_pct)
-                shares = int(allocatable_cash // exec_price)
-                
-                if shares > 0:
-                    gross_cost = shares * exec_price
-                    commission = gross_cost * commission_rate
-                    slippage_cost = shares * price * slippage_pct
-                    
-                    total_cost = gross_cost + commission
-                    cash -= total_cost
-                    position += shares
-                    entry_price = exec_price
-                    
-                    # Track cumulative fees
+            # 3. Check Signals
+            if execution_timing == "next_bar_open":
+                if position == 0 and signal == 1:
+                    pending_action = "buy"
+                elif position > 0 and signal == -1:
+                    pending_action = "sell"
+            else:
+                # Deprecated same_bar_close execution
+                if position == 0 and signal == 1:
+                    allocatable_cash = cash * position_size_pct
+                    exec_price = price * (1 + slippage_pct)
+                    shares = int(allocatable_cash // exec_price)
+                    if shares > 0:
+                        gross_cost = shares * exec_price
+                        commission = gross_cost * commission_rate
+                        slippage_cost = shares * price * slippage_pct
+                        cash -= (gross_cost + commission)
+                        position += shares
+                        entry_price = exec_price
+                        total_commission += commission
+                        total_slippage += slippage_cost
+                        trades.append({
+                            "type": "buy",
+                            "date": date.strftime("%Y-%m-%d"),
+                            "price": exec_price,
+                            "shares": shares,
+                            "cash_after": cash,
+                            "reason": "Signal (Same-Bar Deprecated)",
+                        })
+                elif position > 0 and signal == -1:
+                    exec_price = price * (1 - slippage_pct)
+                    gross_proceeds = position * exec_price
+                    commission = gross_proceeds * commission_rate
+                    tax = gross_proceeds * tax_rate
+                    slippage_cost = position * price * slippage_pct
+                    net_proceeds = gross_proceeds - commission - tax
+                    cash += net_proceeds
+                    trade_pnl = (exec_price - entry_price) * position - commission - tax
                     total_commission += commission
+                    total_tax += tax
                     total_slippage += slippage_cost
-                    
                     trades.append({
-                        "type": "buy",
+                        "type": "sell",
                         "date": date.strftime("%Y-%m-%d"),
                         "price": exec_price,
                         "market_price": price,
-                        "shares": shares,
+                        "shares": position,
                         "commission": round(commission, 2),
+                        "tax": round(tax, 2),
                         "slippage": round(slippage_cost, 2),
                         "cash_after": cash,
-                        "reason": "Signal"
+                        "reason": "Signal (Same-Bar Deprecated)",
+                        "pnl": round(trade_pnl, 2),
                     })
-            
-            elif position > 0 and signal == -1:
-                # Sell Logic (Signal Exit)
-                # Apply slippage to execution price (sell at lower price)
-                exec_price = price * (1 - slippage_pct)
-                gross_proceeds = position * exec_price
-                
-                # Calculate fees: commission + tax (only on sell in Taiwan)
-                commission = gross_proceeds * commission_rate
-                tax = gross_proceeds * tax_rate
-                slippage_cost = position * price * slippage_pct
-                
-                net_proceeds = gross_proceeds - commission - tax
-                cash += net_proceeds
-                
-                # Track cumulative fees
-                total_commission += commission + tax
-                total_slippage += slippage_cost
-                
-                gross_pnl = (exec_price - entry_price) * position
-                net_pnl = gross_pnl - commission - tax
-                
-                trades.append({
-                    "type": "sell",
-                    "date": date.strftime("%Y-%m-%d"),
-                    "price": exec_price,
-                    "market_price": price,
-                    "shares": position,
-                    "commission": round(commission, 2),
-                    "tax": round(tax, 2),
-                    "slippage": round(slippage_cost, 2),
-                    "cash_after": cash,
-                    "reason": "Signal",
-                    "gross_pnl": round(gross_pnl, 2),
-                    "pnl": round(net_pnl, 2)
-                })
-                position = 0
-                entry_price = 0.0
+                    position = 0
+                    entry_price = 0.0
             
             # Track daily equity
             daily_value = cash + (position * price)

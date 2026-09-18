@@ -35,6 +35,16 @@ class MarketEvent:
 
 
 @dataclass(frozen=True)
+class TickEvent:
+    timestamp: datetime
+    symbol: str
+    price: float
+    volume: float
+    bid_price: Optional[float] = None
+    ask_price: Optional[float] = None
+
+
+@dataclass(frozen=True)
 class BarEvent:
     timestamp: datetime
     symbol: str
@@ -73,6 +83,7 @@ class RiskDecision:
     timestamp: datetime = field(default_factory=datetime.now)
     order_id: Optional[str] = None
     rule_violated: Optional[str] = None
+    metrics_snapshot: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

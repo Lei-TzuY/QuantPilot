@@ -98,6 +98,7 @@ class TestShadowModeLiveMarketToPaperExecution(unittest.TestCase):
             bar_builder=bar_builder,
             trading_mode="shadow",
             default_order_shares=1000,
+            test_only_synchronous=True,
         )
 
         # 4. Wire market data stream into engine

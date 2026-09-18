@@ -12,6 +12,7 @@ from modules.execution.fees import TaiwanFeeModel
 from modules.execution.order import Order, OrderSide, OrderStatus, OrderType
 from modules.execution.fills import Fill
 from modules.execution.position import Position
+from modules.market.tick_size import TaiwanTickSizeModel, default_tick_model
 
 
 class PaperBrokerAdapter(BrokerAdapter):
@@ -31,6 +32,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         enable_partial_fills: bool = False,
         partial_fill_fraction: float = 0.5, # When enabled, fills in 50% chunks
         fee_model: Optional[TaiwanFeeModel] = None,
+        tick_model: Optional[TaiwanTickSizeModel] = None,
     ):
         super().__init__()
         self.initial_cash = initial_cash
@@ -48,6 +50,7 @@ class PaperBrokerAdapter(BrokerAdapter):
             slippage_pct=slippage_pct,
             min_commission=min_commission,
         )
+        self.tick_model = tick_model or default_tick_model
 
         self._positions: Dict[str, Position] = {}
         self._orders: Dict[str, Order] = {}
@@ -205,6 +208,8 @@ class PaperBrokerAdapter(BrokerAdapter):
             if order.order_type == OrderType.MARKET:
                 self._execute_fill(order, ref_price)
             elif order.order_type == OrderType.LIMIT:
+                if order.price is not None and not self.tick_model.is_valid_tick(order.price):
+                    order.price = self.tick_model.normalize_limit_price(order.price, order.side)
                 # Immediate check if limit price crosses market
                 if order.side == OrderSide.BUY and ref_price <= (order.price or 0.0):
                     self._execute_fill(order, ref_price)
@@ -215,15 +220,16 @@ class PaperBrokerAdapter(BrokerAdapter):
             return order
 
     def _execute_fill(self, order: Order, base_price: float) -> None:
-        """Executes a fill or partial fill against base price."""
+        """Executes a fill or partial fill against base price adhering to TWSE tick sizes."""
         if not order.is_active:
             return
 
-        # Apply slippage
-        if order.side == OrderSide.BUY:
-            exec_price = round(base_price * (1.0 + self.slippage_pct), 2)
-        else:
-            exec_price = round(base_price * (1.0 - self.slippage_pct), 2)
+        # Apply slippage conforming to Taiwan exchange tick sizes
+        exec_price = self.tick_model.apply_execution_slippage(
+            base_price=base_price,
+            side=order.side,
+            slippage_pct=self.slippage_pct,
+        )
 
         fill_qty = order.remaining_quantity
         if self.enable_partial_fills and order.remaining_quantity > 1:

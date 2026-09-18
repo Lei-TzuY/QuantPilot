@@ -40,6 +40,7 @@ class SymbolDataHealth:
     reconnect_gaps_count: int = 0
     last_anomaly_reason: Optional[str] = None
     last_anomaly_timestamp: Optional[datetime] = None
+    has_incident: bool = False
 
 
 class MarketDataIntegrityChecker:
@@ -176,8 +177,18 @@ class MarketDataIntegrityChecker:
             health.last_receive_timestamp = tick.receive_timestamp or now
             health.last_sequence = tick.sequence
             health.last_price = tick.price
-            health.status = MarketHealthStatus.HEALTHY
+            if not health.has_incident:
+                health.status = MarketHealthStatus.HEALTHY
             return True, None
+
+    def record_incident(self, symbol: str, reason: str) -> None:
+        """Records an external/queue incident and flags symbol health as DEGRADED."""
+        with self._lock:
+            h = self._get_or_create(symbol)
+            h.status = MarketHealthStatus.DEGRADED
+            h.has_incident = True
+            h.last_anomaly_reason = reason
+            h.last_anomaly_timestamp = datetime.now()
 
     def record_disconnect(self, symbol: Optional[str] = None) -> None:
         with self._lock:
@@ -193,10 +204,12 @@ class MarketDataIntegrityChecker:
             if symbol:
                 h = self._get_or_create(symbol)
                 h.reconnect_gaps_count += 1
+                h.has_incident = False
                 h.status = MarketHealthStatus.HEALTHY
             else:
                 for h in self._symbol_health.values():
                     h.reconnect_gaps_count += 1
+                    h.has_incident = False
                     h.status = MarketHealthStatus.HEALTHY
 
     def get_health(self, symbol: str) -> MarketHealthStatus:

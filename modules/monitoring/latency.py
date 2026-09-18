@@ -70,17 +70,32 @@ class LatencyTracker:
         receive_ts: Optional[datetime],
         enqueue_ts: Optional[datetime],
         dequeue_ts: Optional[datetime],
+        enqueue_ns: Optional[int] = None,
+        dequeue_ns: Optional[int] = None,
+        is_replay: bool = False,
     ) -> None:
-        """Convenience recorder for tick ingestion pipeline."""
-        now = datetime.now()
-        recv = receive_ts or now
+        """
+        Records market data feed latency and queue dwell latency.
+        Guarantees:
+        - NEVER compares historical replay exchange timestamps against machine wall clock.
+        - Uses monotonic high-resolution nanosecond timers for internal queue duration.
+        """
         # Market data feed latency (exchange -> local receive)
-        mkt_lat = (recv - exchange_ts).total_seconds() * 1000.0
-        if mkt_lat >= 0:
-            self.record_stage_latency("market_data", mkt_lat)
+        if receive_ts and exchange_ts:
+            mkt_lat = (receive_ts - exchange_ts).total_seconds() * 1000.0
+            if 0.0 <= mkt_lat < 300_000.0:  # Valid only if within realistic 5-minute window
+                self.record_stage_latency("market_data", mkt_lat)
+        elif not is_replay and exchange_ts:
+            # Only for live feeds when local receive time was not explicitly stamped
+            mkt_lat = (datetime.now() - exchange_ts).total_seconds() * 1000.0
+            if 0.0 <= mkt_lat < 300_000.0:
+                self.record_stage_latency("market_data", mkt_lat)
 
-        # Queue latency (enqueue -> dequeue)
-        if enqueue_ts and dequeue_ts:
+        # Queue latency (enqueue -> dequeue) - Prefer monotonic nanoseconds
+        if enqueue_ns is not None and dequeue_ns is not None:
+            q_lat = max(0.0, (dequeue_ns - enqueue_ns) / 1_000_000.0)
+            self.record_stage_latency("queue", q_lat)
+        elif enqueue_ts and dequeue_ts:
             q_lat = (dequeue_ts - enqueue_ts).total_seconds() * 1000.0
             if q_lat >= 0:
                 self.record_stage_latency("queue", q_lat)

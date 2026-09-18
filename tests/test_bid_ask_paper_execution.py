@@ -10,6 +10,7 @@ import unittest
 
 from modules.brokers.paper import PaperBrokerAdapter
 from modules.execution.order import Order, OrderSide, OrderStatus, OrderType, TimeInForce
+from modules.market.tick_size import TaiwanTickSizeModel
 
 
 class TestBidAskPaperExecution(unittest.TestCase):
@@ -43,9 +44,10 @@ class TestBidAskPaperExecution(unittest.TestCase):
         self.assertEqual(len(fills), 1)
 
         fill = fills[0]
-        expected_price = round(952.0 * (1 + 0.0005), 2)
+        expected_price = TaiwanTickSizeModel.apply_execution_slippage(952.0, OrderSide.BUY, slippage_pct=0.0005)
         self.assertEqual(fill.price, expected_price)
         self.assertEqual(submitted.average_fill_price, expected_price)
+        self.assertTrue(TaiwanTickSizeModel.is_valid_tick(fill.price))
         self.assertGreaterEqual(fill.price, 952.0)
 
     def test_market_sell_executes_against_bid_minus_slippage(self):
@@ -80,9 +82,10 @@ class TestBidAskPaperExecution(unittest.TestCase):
         self.assertEqual(len(fills), 1)
 
         fill = fills[0]
-        expected_price = round(948.0 * (1 - 0.0005), 2)
+        expected_price = TaiwanTickSizeModel.apply_execution_slippage(948.0, OrderSide.SELL, slippage_pct=0.0005)
         self.assertEqual(fill.price, expected_price)
         self.assertEqual(submitted.average_fill_price, expected_price)
+        self.assertTrue(TaiwanTickSizeModel.is_valid_tick(fill.price))
         self.assertLessEqual(fill.price, 948.0)
 
     def test_limit_buy_crossing_semantics(self):

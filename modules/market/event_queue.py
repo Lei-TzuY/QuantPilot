@@ -8,6 +8,7 @@ from datetime import datetime
 import logging
 import queue
 import threading
+import time
 from typing import Callable, List, Optional
 
 from modules.execution.events import TickEvent
@@ -44,11 +45,12 @@ class MarketDataEventQueue:
         capacity: int = 10_000,
         name: str = "MarketDataQueue",
         synchronous: bool = False,
+        test_only_synchronous: bool = False,
         on_overflow: Optional[Callable[[TickEvent, QueueMetrics], None]] = None,
     ):
         self.capacity = capacity
         self.name = name
-        self.synchronous = synchronous
+        self.synchronous = test_only_synchronous or synchronous
         self.on_overflow = on_overflow
 
         self._queue: queue.Queue = queue.Queue(maxsize=capacity)
@@ -73,17 +75,15 @@ class MarketDataEventQueue:
     def enqueue(self, tick: TickEvent) -> bool:
         """
         Non-blocking enqueue for market callbacks.
-        Attaches monotonic sequence number and enqueue timestamp.
+        Attaches monotonic sequence number, enqueue wall timestamp, and monotonic nanoseconds.
         """
         now = datetime.now()
+        now_ns = time.perf_counter_ns()
         with self._lock:
             self._seq_counter += 1
             seq = self._seq_counter
-            current_qsize = self._queue.qsize()
-            if current_qsize > self._max_depth:
-                self._max_depth = current_qsize
 
-        # Create updated TickEvent with sequence and enqueue timestamp
+        # Create updated TickEvent with sequence and enqueue timestamps
         stamped_tick = TickEvent(
             timestamp=tick.timestamp,
             symbol=tick.symbol,
@@ -95,10 +95,12 @@ class MarketDataEventQueue:
             ask_volume=tick.ask_volume,
             receive_timestamp=tick.receive_timestamp or now,
             enqueue_timestamp=now,
+            enqueue_ns=now_ns,
             sequence=seq,
             tick_type=tick.tick_type,
             source=tick.source,
             simtrade=tick.simtrade,
+            is_replay=getattr(tick, "is_replay", False),
         )
 
         if self.synchronous:
@@ -117,10 +119,13 @@ class MarketDataEventQueue:
                 receive_timestamp=stamped_tick.receive_timestamp,
                 enqueue_timestamp=stamped_tick.enqueue_timestamp,
                 dequeue_timestamp=datetime.now(),
+                enqueue_ns=stamped_tick.enqueue_ns,
+                dequeue_ns=time.perf_counter_ns(),
                 sequence=stamped_tick.sequence,
                 tick_type=stamped_tick.tick_type,
                 source=stamped_tick.source,
                 simtrade=stamped_tick.simtrade,
+                is_replay=stamped_tick.is_replay,
             )
             for subscriber in list(self._subscribers):
                 try:
@@ -133,6 +138,10 @@ class MarketDataEventQueue:
             self._queue.put_nowait(stamped_tick)
             with self._lock:
                 self._total_enqueued += 1
+                # Enforce accounting: measure queue depth AFTER successful enqueue!
+                current_qsize = self._queue.qsize()
+                if current_qsize > self._max_depth:
+                    self._max_depth = current_qsize
             return True
         except queue.Full:
             with self._lock:
@@ -180,14 +189,23 @@ class MarketDataEventQueue:
             self._consumer_thread.join(timeout=timeout)
         logger.info(f"MarketDataEventQueue stopped. Total enqueued={self._total_enqueued}, dequeued={self._total_dequeued}")
 
-    def drain(self, timeout: float = 5.0) -> None:
+    def drain(self, timeout: float = 10.0) -> None:
         """Waits until all enqueued items are processed or timeout is reached."""
-        start_t = datetime.now()
-        while not self._queue.empty():
-            if (datetime.now() - start_t).total_seconds() > timeout:
+        start_t = time.time()
+        while getattr(self._queue, "unfinished_tasks", 0) > 0 or not self._queue.empty():
+            if time.time() - start_t > timeout:
                 logger.warning("MarketDataEventQueue drain timeout reached before queue emptied.")
                 break
-            threading.Event().wait(0.01)
+            time.sleep(0.01)
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        """Blocks until all items in the queue have been gotten and processed."""
+        if self.synchronous:
+            return
+        if timeout is None:
+            self._queue.join()
+        else:
+            self.drain(timeout=timeout)
 
     def _worker_loop(self) -> None:
         """Consumer worker loop dispatching ticks to downstream subscribers."""
@@ -198,10 +216,11 @@ class MarketDataEventQueue:
                 continue
 
             dequeue_time = datetime.now()
+            dequeue_ns = time.perf_counter_ns()
             with self._lock:
                 self._total_dequeued += 1
 
-            # Attach dequeue timestamp
+            # Attach dequeue timestamp and monotonic nanoseconds
             processed_tick = TickEvent(
                 timestamp=tick.timestamp,
                 symbol=tick.symbol,
@@ -214,10 +233,13 @@ class MarketDataEventQueue:
                 receive_timestamp=tick.receive_timestamp,
                 enqueue_timestamp=tick.enqueue_timestamp,
                 dequeue_timestamp=dequeue_time,
+                enqueue_ns=tick.enqueue_ns,
+                dequeue_ns=dequeue_ns,
                 sequence=tick.sequence,
                 tick_type=tick.tick_type,
                 source=tick.source,
                 simtrade=tick.simtrade,
+                is_replay=getattr(tick, "is_replay", False),
             )
 
             # Dispatch to subscribers

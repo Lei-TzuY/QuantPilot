@@ -47,10 +47,13 @@ class TickEvent:
     receive_timestamp: Optional[datetime] = None
     enqueue_timestamp: Optional[datetime] = None
     dequeue_timestamp: Optional[datetime] = None
+    enqueue_ns: Optional[int] = None
+    dequeue_ns: Optional[int] = None
     sequence: int = 0
     tick_type: str = "trade"
     source: str = "shioaji"
     simtrade: bool = False
+    is_replay: bool = False
 
 
 @dataclass(frozen=True)

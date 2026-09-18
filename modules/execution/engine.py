@@ -5,10 +5,12 @@ Coordinates event-driven pipeline: MarketData -> Strategy -> Risk -> OMS -> Brok
 from datetime import datetime
 import logging
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from modules.brokers.base import BrokerAdapter
 from modules.brokers.paper import PaperBrokerAdapter
+from modules.common.clock import IClock, SystemClock
 from modules.execution.events import (
     AuditLogEntry,
     BarEvent,
@@ -57,6 +59,7 @@ class ExecutionEngine:
         risk_engine: RiskEngine,
         order_manager: Optional[OrderManager] = None,
         market_clock: Optional[MarketClock] = None,
+        clock: Optional[IClock] = None,
         persistence: Optional[ExecutionStatePersistence] = None,
         reconciler: Optional[Reconciler] = None,
         journal: Optional[ExecutionJournal] = None,
@@ -69,23 +72,35 @@ class ExecutionEngine:
         latency_tracker: Optional[LatencyTracker] = None,
         supervisor: Optional[ShadowSessionSupervisor] = None,
         reporter: Optional[ShadowSessionReporter] = None,
-        synchronous_queue: bool = True,
+        synchronous_queue: Optional[bool] = None,
+        test_only_synchronous: bool = False,
+        data_source_type: str = "synthetic",
+        soak_mode: str = "ACCELERATED_SIMULATION",
     ):
         self.trading_mode = trading_mode.lower()
         self.broker = broker
         self.risk_engine = risk_engine
         self.order_manager = order_manager or OrderManager()
         self.market_clock = market_clock or MarketClock()
+        self.clock = clock or SystemClock()
         self.persistence = persistence or ExecutionStatePersistence()
         self.reconciler = reconciler or Reconciler()
         self.journal = journal or ExecutionJournal()
         self.bar_builder = bar_builder or BarBuilder(interval_seconds=60)
         self.default_order_shares = default_order_shares
+        self.data_source_type = data_source_type
+        self.soak_mode = soak_mode
+
+        # Determine queue synchronization mode:
+        # Default is strictly asynchronous for SHADOW/LIVE-like pipelines.
+        # Synchronous queue is permitted ONLY as an explicit test-only helper.
+        is_synchronous = synchronous_queue if synchronous_queue is not None else test_only_synchronous
 
         # Production-Safety & Observability Subsystems
         self.event_queue = event_queue or MarketDataEventQueue(
             capacity=10_000,
-            synchronous=synchronous_queue,
+            synchronous=is_synchronous,
+            test_only_synchronous=is_synchronous,
             name="ShadowEventQueue",
         )
         self.integrity_checker = integrity_checker or MarketDataIntegrityChecker()
@@ -100,6 +115,19 @@ class ExecutionEngine:
         self._latest_bars: Dict[str, BarEvent] = {}
         self._lock = threading.RLock()
         self._is_running = False
+        self._is_stopping = False
+
+        # Monotonic session counters
+        self._total_bars_finalized = 0
+        self._total_signals_generated = 0
+        self._total_risk_approvals = 0
+        self._total_risk_rejections = 0
+        self._total_orders_submitted = 0
+        self._total_exceptions = 0
+        self._first_tick_time: Optional[datetime] = None
+        self._last_tick_time: Optional[datetime] = None
+        self._process_start: Optional[datetime] = None
+        self._process_end: Optional[datetime] = None
 
         # Hook broker callbacks
         self.broker.register_order_callback(self._on_broker_order_update)
@@ -125,21 +153,24 @@ class ExecutionEngine:
         Returns immediately without blocking or computing downstream logic.
         """
         with self._lock:
-            if not self._is_running:
+            if not self._is_running or self._is_stopping:
                 return False
+            if self._first_tick_time is None:
+                self._first_tick_time = tick.timestamp
+            self._last_tick_time = tick.timestamp
         return self.event_queue.enqueue(tick)
 
     def _process_dequeued_tick(self, tick: TickEvent) -> None:
         """
         Consumes dequeued tick from event queue:
-        1. Measure queue and network latencies
+        1. Measure queue and network latencies using monotonic clocks
         2. Validate tick against integrity invariants
         3. Persist raw tick in Parquet recorder
         4. Update broker top-of-book bid/ask quotes
         5. Aggregate into 1-minute BarBuilder
         """
         with self._lock:
-            if not self._is_running:
+            if not self._is_running and not self._is_stopping:
                 return
 
             # 1. Latency tracking
@@ -147,7 +178,10 @@ class ExecutionEngine:
                 exchange_ts=tick.timestamp,
                 receive_ts=tick.receive_timestamp,
                 enqueue_ts=tick.enqueue_timestamp,
-                dequeue_ts=tick.dequeue_timestamp or datetime.now(),
+                dequeue_ts=tick.dequeue_timestamp or self.clock.now(),
+                enqueue_ns=getattr(tick, "enqueue_ns", None),
+                dequeue_ns=getattr(tick, "dequeue_ns", None),
+                is_replay=getattr(tick, "is_replay", False),
             )
 
             # 2. Market-data integrity check
@@ -169,8 +203,11 @@ class ExecutionEngine:
                     ask_price=tick.ask_price,
                 )
 
-            # 5. Bar aggregation
+            # 5. Bar aggregation with monotonic timing
+            t_bar_start_ns = time.perf_counter_ns()
             self.bar_builder.on_tick_event(tick)
+            t_bar_ms = (time.perf_counter_ns() - t_bar_start_ns) / 1_000_000.0
+            self.latency_tracker.record_stage_latency("bar_aggregation", t_bar_ms)
 
     def connect_market_data(self, quote_source: Any) -> None:
         """
@@ -209,6 +246,9 @@ class ExecutionEngine:
         Enforces institutional checklists before permitting order flow.
         """
         with self._lock:
+            self._process_start = self.clock.now()
+            self._is_stopping = False
+
             # Lifecycle: INITIALIZING
             if self.supervisor.current_state != SupervisorState.INITIALIZING:
                 self.supervisor.transition_to(SupervisorState.INITIALIZING, "Starting execution engine")
@@ -288,7 +328,15 @@ class ExecutionEngine:
             return True
 
     def stop(self) -> None:
+        """
+        Gracefully stops the execution engine.
+        Critical: Releases self._lock BEFORE draining and joining queue worker
+        to avoid deadlock with workers acquiring self._lock during drain.
+        """
         with self._lock:
+            if self._is_stopping or not self._is_running:
+                return
+            self._is_stopping = True
             if self.supervisor.current_state in (
                 SupervisorState.RUNNING,
                 SupervisorState.DEGRADED,
@@ -297,11 +345,16 @@ class ExecutionEngine:
             ):
                 self.supervisor.transition_to(SupervisorState.CLOSING, "Stopping execution engine")
 
-            self.event_queue.stop(drain=True)
+        # Drain queue worker without holding engine lock
+        self.event_queue.stop(drain=True)
+
+        with self._lock:
             if self.recorder:
                 self.recorder.close()
 
             self._is_running = False
+            self._is_stopping = False
+            self._process_end = self.clock.now()
             self._persist_current_state()
             self._log_event(EventType.SYSTEM, {"action": "STOP"})
 
@@ -326,9 +379,10 @@ class ExecutionEngine:
         Dispatches to strategies, routes signals to RiskEngine, and submits approved orders.
         """
         with self._lock:
-            if not self._is_running:
+            if not self._is_running and not self._is_stopping:
                 return
 
+            self._total_bars_finalized += 1
             self._latest_bars[bar.symbol] = bar
             self._log_event(
                 EventType.BAR,
@@ -359,9 +413,9 @@ class ExecutionEngine:
             # Evaluate registered strategies
             for strat_id, strategy in self._strategies.items():
                 try:
-                    t_strat_start = datetime.now()
+                    t_strat_start_ns = time.perf_counter_ns()
                     signal = strategy.on_bar(bar)
-                    t_strat_ms = (datetime.now() - t_strat_start).total_seconds() * 1000.0
+                    t_strat_ms = (time.perf_counter_ns() - t_strat_start_ns) / 1_000_000.0
                     self.latency_tracker.record_stage_latency("strategy", t_strat_ms)
 
                     if signal:
@@ -372,6 +426,7 @@ class ExecutionEngine:
                             market_data_healthy=data_healthy,
                         )
                 except Exception as e:
+                    self._total_exceptions += 1
                     logger.error(f"Strategy {strat_id} failed on_bar: {e}", exc_info=True)
 
     def _process_signal(
@@ -384,6 +439,7 @@ class ExecutionEngine:
         """
         Processes a SignalEvent through RiskEngine and OMS with full safety validation.
         """
+        self._total_signals_generated += 1
         self._log_event(
             EventType.SIGNAL,
             {
@@ -413,6 +469,7 @@ class ExecutionEngine:
 
         # Intraday cutoff check: do not open new positions past safety cutoff
         if side == OrderSide.BUY and self.market_clock.is_past_intraday_cutoff(bar.timestamp):
+            self._total_risk_rejections += 1
             self._log_event(
                 EventType.RISK_REJECTED,
                 {"reason": "PAST_INTRADAY_CUTOFF", "signal_id": signal.signal_id},
@@ -431,7 +488,7 @@ class ExecutionEngine:
         )
 
         # Evaluate against RiskEngine with latency instrumentation
-        t_risk_start = datetime.now()
+        t_risk_start_ns = time.perf_counter_ns()
         decision = self.risk_engine.evaluate_order(
             request=request,
             current_positions=self._positions,
@@ -441,13 +498,14 @@ class ExecutionEngine:
             strategy_ready=strategy_ready,
             market_data_healthy=market_data_healthy,
         )
-        t_risk_ms = (datetime.now() - t_risk_start).total_seconds() * 1000.0
+        t_risk_ms = (time.perf_counter_ns() - t_risk_start_ns) / 1_000_000.0
         self.latency_tracker.record_stage_latency("risk_evaluation", t_risk_ms)
 
         if self.journal:
+            now_dt = self.clock.now()
             self.journal.record_risk_decision(
-                decision_id=f"RISK-{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
-                timestamp=datetime.now(),
+                decision_id=f"RISK-{now_dt.strftime('%Y%m%d%H%M%S%f')}",
+                timestamp=now_dt,
                 order_id=signal.signal_id or "SIGNAL_ORDER",
                 approved=decision.allowed,
                 reason=decision.reason or "",
@@ -455,6 +513,7 @@ class ExecutionEngine:
             )
 
         if not decision.allowed:
+            self._total_risk_rejections += 1
             self._log_event(
                 EventType.RISK_REJECTED,
                 {
@@ -468,6 +527,8 @@ class ExecutionEngine:
             )
             logger.warning(f"Order for {signal.symbol} rejected by RiskEngine: {decision.reason}")
             return None
+
+        self._total_risk_approvals += 1
 
         # Risk approved -> Create order via OrderManager
         try:
@@ -495,6 +556,7 @@ class ExecutionEngine:
                 signal_id=order.signal_id,
             )
 
+        self._total_orders_submitted += 1
         self._log_event(
             EventType.ORDER_SUBMITTED,
             {
@@ -507,14 +569,22 @@ class ExecutionEngine:
         )
 
         # Submit to BrokerAdapter with latency tracking
-        t_exec_start = datetime.now()
+        t_exec_start_ns = time.perf_counter_ns()
         updated_order = self.broker.submit_order(order)
-        t_exec_ms = (datetime.now() - t_exec_start).total_seconds() * 1000.0
+        t_exec_ms = (time.perf_counter_ns() - t_exec_start_ns) / 1_000_000.0
         self.latency_tracker.record_stage_latency("execution", t_exec_ms)
 
-        # Record end-to-end signal latency
-        e2e_ms = (datetime.now() - bar.timestamp).total_seconds() * 1000.0
-        self.latency_tracker.record_stage_latency("end_to_end", e2e_ms)
+        # Record end-to-end signal latency only if not synthetic replay or if timestamps share the same timeline
+        if self.data_source_type != "replay":
+            now_dt = self.clock.now()
+            bar_ts = bar.timestamp
+            if bar_ts.tzinfo is None and now_dt.tzinfo is not None:
+                bar_ts = bar_ts.replace(tzinfo=now_dt.tzinfo)
+            elif bar_ts.tzinfo is not None and now_dt.tzinfo is None:
+                bar_ts = bar_ts.replace(tzinfo=None)
+            e2e_ms = (now_dt - bar_ts).total_seconds() * 1000.0
+            if 0 <= e2e_ms < 60_000:
+                self.latency_tracker.record_stage_latency("end_to_end", e2e_ms)
 
         self._persist_current_state()
         return updated_order
@@ -748,7 +818,7 @@ class ExecutionEngine:
         Gathers comprehensive end-of-session telemetry and writes JSON and Markdown reports.
         """
         with self._lock:
-            symbols = list(set(list(self._latest_bars.keys()) + list(self._positions.keys())))
+            symbols = sorted(list(set(list(self._latest_bars.keys()) + list(self._positions.keys()))))
             if not symbols:
                 symbols = ["2330"]
 
@@ -768,8 +838,9 @@ class ExecutionEngine:
             q_metrics = self.event_queue.get_metrics()
             lat_snapshot = self.latency_tracker.get_snapshot()
 
-            now = datetime.now()
-            start_time = self._latest_bars[symbols[0]].timestamp if (symbols and symbols[0] in self._latest_bars) else now
+            now = self.clock.now()
+            market_start = self._first_tick_time or (self._latest_bars[symbols[0]].timestamp if (symbols and symbols[0] in self._latest_bars) else now)
+            market_end = self._last_tick_time or (self._latest_bars[symbols[0]].timestamp if (symbols and symbols[0] in self._latest_bars) else now)
 
             data_health_incidents = sum(
                 h.duplicate_count + h.out_of_order_count + h.stale_count + h.price_anomaly_count
@@ -779,15 +850,21 @@ class ExecutionEngine:
             report = self.reporter.build_report(
                 session_id=self.supervisor.session_id,
                 symbols=symbols,
-                start_time=start_time,
-                end_time=now,
+                start_time=market_start,
+                end_time=market_end,
+                market_session_start=market_start,
+                market_session_end=market_end,
+                process_start=self._process_start or now,
+                process_end=self._process_end or now,
+                first_tick_time=self._first_tick_time,
+                last_tick_time=self._last_tick_time,
                 ticks_received=q_metrics.total_enqueued,
                 ticks_valid=q_metrics.total_dequeued,
                 ticks_rejected=q_metrics.dropped_count,
-                bars_count=len(self._latest_bars),
-                signals_count=len([e for e in self._audit_log if e.event_type == EventType.SIGNAL]),
-                risk_approvals=len([e for e in self._audit_log if e.event_type == EventType.ORDER_SUBMITTED]),
-                risk_rejections=len([e for e in self._audit_log if e.event_type == EventType.RISK_REJECTED]),
+                bars_count=self._total_bars_finalized,
+                signals_count=self._total_signals_generated,
+                risk_approvals=self._total_risk_approvals,
+                risk_rejections=self._total_risk_rejections,
                 orders_submitted=orders_submitted,
                 orders_filled=orders_filled,
                 orders_rejected=orders_rejected,
@@ -804,7 +881,15 @@ class ExecutionEngine:
                 reconciliation_count=len([e for e in self._audit_log if e.event_type == EventType.SYSTEM and e.payload.get("action") == "RECONCILIATION"]),
                 kill_switch_events=1 if self.risk_engine.kill_switch.is_halted() else 0,
                 data_health_incidents=data_health_incidents,
-                exceptions_count=0,
+                exceptions_count=self._total_exceptions,
+                trading_mode=self.trading_mode,
+                data_source_type=self.data_source_type,
+                clock_mode=type(self.clock).__name__,
+                queue_mode="synchronous" if self.event_queue.synchronous else "asynchronous",
+                soak_mode=self.soak_mode,
+                provenance={
+                    "strategy_ids": list(self._strategies.keys()),
+                },
                 latency_snapshot=lat_snapshot,
             )
             self.reporter.persist_report(report)

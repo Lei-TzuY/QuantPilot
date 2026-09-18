@@ -28,12 +28,14 @@ from modules.execution.order_manager import OrderManager
 from modules.execution.persistence import ExecutionStatePersistence
 from modules.execution.position import Position
 from modules.execution.reconciliation import (
-    DiscrepancySeverity,
     DiscrepancyType,
     Reconciler,
+    ReconciliationDiscrepancy,
+    ReconciliationReport,
 )
 from modules.execution.engine import ExecutionEngine
 from modules.market.clock import MarketClock, MarketSession
+from modules.market.tick_size import TaiwanTickSizeModel
 from modules.risk.engine import RiskEngine
 from modules.risk.kill_switch import KillSwitch, KillSwitchStatus
 from modules.risk.limits import RiskLimits
@@ -141,9 +143,10 @@ class TestExecutionPlatform(unittest.TestCase):
         # The order must have been created with timestamp >= bar_t0.timestamp
         self.assertGreaterEqual(order.created_at, bar_t0.timestamp)
 
-        # In paper broker with slippage (0.1%), execution price is 100 * 1.001 = 100.1
+        # In paper broker with slippage (0.1%), execution price is normalized to Taiwan tick (100 -> 100.5)
         self.assertEqual(order.status, OrderStatus.FILLED)
-        self.assertAlmostEqual(order.average_fill_price, 100.1, places=2)
+        expected_fill = TaiwanTickSizeModel.apply_execution_slippage(100.0, OrderSide.BUY, slippage_pct=0.001)
+        self.assertAlmostEqual(order.average_fill_price, expected_fill, places=2)
 
         # Bar t+1 comes in at price 105
         bar_t1 = BarEvent(timestamp=t1, symbol="2330", open=100.5, high=106.0, low=100.2, close=105.0, volume=6000)
@@ -153,8 +156,8 @@ class TestExecutionPlatform(unittest.TestCase):
         positions = self.engine.get_positions()
         self.assertIn("2330", positions)
         self.assertEqual(positions["2330"].quantity, 1000)
-        # Unrealized PnL evaluated against bar_t1 close (105 - 100.1) * 1000 = 4900
-        self.assertAlmostEqual(positions["2330"].unrealized_pnl(105.0), (105.0 - 100.1) * 1000, places=2)
+        # Unrealized PnL evaluated against bar_t1 close (105 - expected_fill) * 1000
+        self.assertAlmostEqual(positions["2330"].unrealized_pnl(105.0), (105.0 - expected_fill) * 1000, places=2)
 
     # --------------------------------------------------------------------------
     # 2. End-to-End Signal -> Risk -> OMS -> Broker -> Fill Flow
@@ -330,17 +333,21 @@ class TestExecutionPlatform(unittest.TestCase):
         broker.connect()
         broker.set_market_price("2330", 100.0)
 
-        # BUY order: expected fill price = 100 * (1 + 0.002) = 100.2
+        # BUY order: expected fill price = 100 * (1 + 0.002) = 100.2 -> rounded up to valid tick 100.5
         buy_order = Order(order_id="O-BUY", symbol="2330", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=100)
         broker.submit_order(buy_order)
         self.assertEqual(buy_order.status, OrderStatus.FILLED)
-        self.assertAlmostEqual(buy_order.average_fill_price, 100.2, places=4)
+        expected_buy = TaiwanTickSizeModel.apply_execution_slippage(100.0, OrderSide.BUY, slippage_pct=0.002)
+        self.assertAlmostEqual(buy_order.average_fill_price, expected_buy, places=4)
+        self.assertTrue(TaiwanTickSizeModel.is_valid_tick(buy_order.average_fill_price))
 
-        # SELL order: expected fill price = 100 * (1 - 0.002) = 99.8
+        # SELL order: expected fill price = 100 * (1 - 0.002) = 99.8 -> rounded down to valid tick 99.8
         sell_order = Order(order_id="O-SELL", symbol="2330", side=OrderSide.SELL, order_type=OrderType.MARKET, quantity=100)
         broker.submit_order(sell_order)
         self.assertEqual(sell_order.status, OrderStatus.FILLED)
-        self.assertAlmostEqual(sell_order.average_fill_price, 99.8, places=4)
+        expected_sell = TaiwanTickSizeModel.apply_execution_slippage(100.0, OrderSide.SELL, slippage_pct=0.002)
+        self.assertAlmostEqual(sell_order.average_fill_price, expected_sell, places=4)
+        self.assertTrue(TaiwanTickSizeModel.is_valid_tick(sell_order.average_fill_price))
 
     # --------------------------------------------------------------------------
     # 7. Duplicate Order Prevention

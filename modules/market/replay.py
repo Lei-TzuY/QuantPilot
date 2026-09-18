@@ -205,8 +205,12 @@ class ReplayMarketDataSource:
                 delta_sec = (tick.timestamp - last_tick_time).total_seconds()
                 if delta_sec > 0:
                     delay = delta_sec / self.speed_factor
-                    # Cap single sleep to 1.0s to remain responsive
-                    time.sleep(min(1.0, max(0.0, delay)))
+                    # Interruptible sleep in micro-slices to maintain responsiveness without capping delay
+                    remaining = delay
+                    while remaining > 0 and self._is_running and not self._is_paused:
+                        step = min(0.05, remaining)
+                        time.sleep(step)
+                        remaining -= step
 
             last_tick_time = tick.timestamp
             self._notify(tick)

@@ -83,12 +83,120 @@ class MarketDataSource(ABC):
         pass
 
 
+class ShioajiSDKCompat:
+    """
+    Centralized compatibility adapter for SinoPac Shioaji Python SDK.
+    Prioritizes modern Shioaji v1.5.x - v1.7.x top-level API methods,
+    with graceful fallback to legacy `api.quote.*` methods if present.
+    """
+
+    @staticmethod
+    def get_sdk_version() -> str:
+        if SHIOAJI_AVAILABLE and sj is not None and hasattr(sj, "__version__"):
+            return str(sj.__version__)
+        return "not installed"
+
+    @staticmethod
+    def register_tick_callback(api: Any, callback: Callable) -> bool:
+        """
+        Binds native stock V1 tick callback.
+        Modern: api.set_on_tick_stk_v1_callback(callback)
+        Legacy fallback: api.quote.set_on_tick_stk_v1_callback(callback) or api.quote.set_on_tick_callback(callback)
+        """
+        if hasattr(api, "set_on_tick_stk_v1_callback"):
+            api.set_on_tick_stk_v1_callback(callback)
+            return True
+        elif hasattr(api, "set_on_tick_callback"):
+            api.set_on_tick_callback(callback)
+            return True
+        elif hasattr(api, "quote"):
+            quote = api.quote
+            if hasattr(quote, "set_on_tick_stk_v1_callback"):
+                quote.set_on_tick_stk_v1_callback(callback)
+                return True
+            elif hasattr(quote, "set_on_tick_callback"):
+                quote.set_on_tick_callback(callback)
+                return True
+        logger.warning("No supported native tick callback registration method found on Shioaji API instance.")
+        return False
+
+    @staticmethod
+    def register_bidask_callback(api: Any, callback: Callable) -> bool:
+        """
+        Binds native stock V1 bidask callback.
+        Modern: api.set_on_bidask_stk_v1_callback(callback)
+        Legacy fallback: api.quote.set_on_bidask_stk_v1_callback(callback) or api.quote.set_on_bidask_callback(callback)
+        """
+        if hasattr(api, "set_on_bidask_stk_v1_callback"):
+            api.set_on_bidask_stk_v1_callback(callback)
+            return True
+        elif hasattr(api, "set_on_bidask_callback"):
+            api.set_on_bidask_callback(callback)
+            return True
+        elif hasattr(api, "quote"):
+            quote = api.quote
+            if hasattr(quote, "set_on_bidask_stk_v1_callback"):
+                quote.set_on_bidask_stk_v1_callback(callback)
+                return True
+            elif hasattr(quote, "set_on_bidask_callback"):
+                quote.set_on_bidask_callback(callback)
+                return True
+        logger.warning("No supported native bidask callback registration method found on Shioaji API instance.")
+        return False
+
+    @staticmethod
+    def register_event_callback(api: Any, callback: Callable) -> bool:
+        """
+        Binds native Solace event callback.
+        Modern: api.set_event_callback(callback)
+        Legacy fallback: api.quote.set_event_callback(callback)
+        """
+        if hasattr(api, "set_event_callback"):
+            api.set_event_callback(callback)
+            return True
+        elif hasattr(api, "quote") and hasattr(api.quote, "set_event_callback"):
+            api.quote.set_event_callback(callback)
+            return True
+        logger.warning("No supported event callback registration method found on Shioaji API instance.")
+        return False
+
+    @staticmethod
+    def subscribe(api: Any, contract: Any, quote_type: Any) -> bool:
+        """
+        Subscribes to market data for contract and quote_type.
+        Modern: api.subscribe(contract, quote_type=quote_type)
+        Legacy fallback: api.quote.subscribe(contract, quote_type=quote_type)
+        """
+        if hasattr(api, "subscribe"):
+            api.subscribe(contract, quote_type=quote_type)
+            return True
+        elif hasattr(api, "quote") and hasattr(api.quote, "subscribe"):
+            api.quote.subscribe(contract, quote_type=quote_type)
+            return True
+        raise AttributeError("Neither api.subscribe nor api.quote.subscribe is available on API instance.")
+
+    @staticmethod
+    def unsubscribe(api: Any, contract: Any, quote_type: Any) -> bool:
+        """
+        Unsubscribes from market data for contract and quote_type.
+        Modern: api.unsubscribe(contract, quote_type=quote_type)
+        Legacy fallback: api.quote.unsubscribe(contract, quote_type=quote_type)
+        """
+        if hasattr(api, "unsubscribe"):
+            api.unsubscribe(contract, quote_type=quote_type)
+            return True
+        elif hasattr(api, "quote") and hasattr(api.quote, "unsubscribe"):
+            api.quote.unsubscribe(contract, quote_type=quote_type)
+            return True
+        raise AttributeError("Neither api.unsubscribe nor api.quote.unsubscribe is available on API instance.")
+
+
 class ShioajiMarketDataSource(MarketDataSource):
     """
     SinoPac Shioaji Quote-Only Streaming Market Data Transport.
     Features:
-    - Official native stock V1 callbacks on `api.quote`:
-        - `set_on_tick_stk_v1_callback`
+    - Official native stock V1 callbacks via ShioajiSDKCompat:
+        - `set_on_tick_stk_v1_callback` (Modern top-level with legacy quote fallback)
         - `set_on_bidask_stk_v1_callback`
         - `set_event_callback`
     - Full dual subscription (Tick + BidAsk) and unsubscription.
@@ -104,8 +212,9 @@ class ShioajiMarketDataSource(MarketDataSource):
         simulation: bool = True,
         api_instance: Optional[Any] = None,
     ):
-        self.api_key = api_key or os.getenv("SHIOAJI_API_KEY", "")
-        self.secret_key = secret_key or os.getenv("SHIOAJI_SECRET_KEY", "")
+        # Support official aliases: SHIOAJI_API_KEY > SJ_API_KEY, SHIOAJI_SECRET_KEY > SJ_SEC_KEY
+        self.api_key = api_key or os.getenv("SHIOAJI_API_KEY") or os.getenv("SJ_API_KEY", "")
+        self.secret_key = secret_key or os.getenv("SHIOAJI_SECRET_KEY") or os.getenv("SJ_SEC_KEY", "")
         self.simulation = simulation
 
         self._api = api_instance
@@ -129,6 +238,8 @@ class ShioajiMarketDataSource(MarketDataSource):
         self._disconnect_count = 0
         self._reconnect_count = 0
         self._resubscribe_count = 0
+        self._first_tick_time: Optional[datetime] = None
+        self._first_bidask_time: Optional[datetime] = None
         self._last_tick_time: Optional[datetime] = None
         self._last_bidask_time: Optional[datetime] = None
         self._last_error: Optional[str] = None
@@ -138,6 +249,16 @@ class ShioajiMarketDataSource(MarketDataSource):
         with self._lock:
             return self._state
 
+    @property
+    def subscribed_tick_symbols(self) -> Set[str]:
+        with self._lock:
+            return set(self._subscribed_tick_symbols)
+
+    @property
+    def subscribed_bidask_symbols(self) -> Set[str]:
+        with self._lock:
+            return set(self._subscribed_bidask_symbols)
+
     def is_connected(self) -> bool:
         with self._lock:
             return self._state in (
@@ -145,6 +266,11 @@ class ShioajiMarketDataSource(MarketDataSource):
                 ConnectionState.SUBSCRIBING,
                 ConnectionState.STREAMING,
             )
+
+    def has_received_genuine_events(self) -> bool:
+        """Returns True if at least one genuine tick AND one genuine bidask have been received."""
+        with self._lock:
+            return self._ticks_received_count > 0 and self._bidask_received_count > 0
 
     def register_tick_callback(self, callback: Callable[[TickEvent], None]) -> None:
         with self._lock:
@@ -157,13 +283,17 @@ class ShioajiMarketDataSource(MarketDataSource):
                 self._bidask_callbacks.append(callback)
 
     def connect(self) -> bool:
-        """Authenticates with Shioaji and binds native callbacks to `api.quote`."""
+        """Authenticates with Shioaji and binds native callbacks via ShioajiSDKCompat."""
         with self._lock:
             if self._state in (ConnectionState.AUTHENTICATED, ConnectionState.STREAMING):
                 return True
 
             self._state = ConnectionState.CONNECTING
-            logger.info("Connecting ShioajiMarketDataSource (quote-only)...")
+            sdk_ver = ShioajiSDKCompat.get_sdk_version()
+            logger.info(
+                f"Connecting ShioajiMarketDataSource (quote-only) | "
+                f"SDK Version: {sdk_ver} | Simulation: {self.simulation}..."
+            )
 
             if self._custom_api_provided and self._api:
                 self._register_native_callbacks(self._api)
@@ -189,7 +319,7 @@ class ShioajiMarketDataSource(MarketDataSource):
                 )
                 self._register_native_callbacks(self._api)
                 self._state = ConnectionState.AUTHENTICATED
-                logger.info("ShioajiMarketDataSource authenticated successfully.")
+                logger.info(f"ShioajiMarketDataSource authenticated successfully (SDK {sdk_ver}).")
                 return True
             except Exception as e:
                 self._state = ConnectionState.DISCONNECTED
@@ -198,29 +328,13 @@ class ShioajiMarketDataSource(MarketDataSource):
                 raise ConnectionError(f"Failed to connect Shioaji quote transport: {e}")
 
     def _register_native_callbacks(self, api: Any) -> None:
-        """Binds native SDK stock V1 tick and bidask callbacks on `api.quote`."""
-        if not hasattr(api, "quote"):
-            logger.warning("API instance missing 'quote' attribute; skipping native callback hooks.")
-            return
-
-        quote = api.quote
-        # Register Tick callback
-        if hasattr(quote, "set_on_tick_stk_v1_callback"):
-            quote.set_on_tick_stk_v1_callback(self._on_native_tick)
-        elif hasattr(quote, "set_on_tick_callback"):
-            quote.set_on_tick_callback(self._on_native_tick)
-
-        # Register BidAsk callback
-        if hasattr(quote, "set_on_bidask_stk_v1_callback"):
-            quote.set_on_bidask_stk_v1_callback(self._on_native_bidask)
-        elif hasattr(quote, "set_on_bidask_callback"):
-            quote.set_on_bidask_callback(self._on_native_bidask)
-
-        # Register Event callback (Solace session lifecycle)
-        if hasattr(quote, "set_event_callback"):
-            quote.set_event_callback(self._on_native_event)
-
-        logger.debug("Successfully registered native Shioaji quote callbacks.")
+        """Binds native SDK stock V1 tick and bidask callbacks via ShioajiSDKCompat."""
+        tick_ok = ShioajiSDKCompat.register_tick_callback(api, self._on_native_tick)
+        bidask_ok = ShioajiSDKCompat.register_bidask_callback(api, self._on_native_bidask)
+        event_ok = ShioajiSDKCompat.register_event_callback(api, self._on_native_event)
+        logger.debug(
+            f"Native callback registration status: Tick={tick_ok}, BidAsk={bidask_ok}, Event={event_ok}"
+        )
 
     def subscribe(self, symbols: List[str]) -> None:
         """
@@ -234,6 +348,10 @@ class ShioajiMarketDataSource(MarketDataSource):
                 raise RuntimeError("Cannot subscribe market data: Shioaji source is not connected.")
 
             self._state = ConnectionState.SUBSCRIBING
+
+            quote_type_enum = getattr(sj, "QuoteType", None) or getattr(sj_const, "QuoteType", None)
+            q_type_tick = getattr(quote_type_enum, "Tick", "tick") if quote_type_enum else "tick"
+            q_type_bidask = getattr(quote_type_enum, "BidAsk", "bidask") if quote_type_enum else "bidask"
 
             for sym in symbols:
                 clean_sym = sym.replace(".TW", "").replace(".TWO", "")
@@ -253,17 +371,13 @@ class ShioajiMarketDataSource(MarketDataSource):
 
                     # 1. Subscribe Tick
                     if clean_sym not in self._subscribed_tick_symbols:
-                        quote_type_tick = getattr(sj_const, "QuoteType", None)
-                        q_type = getattr(quote_type_tick, "Tick", "tick") if quote_type_tick else "tick"
-                        self._api.quote.subscribe(contract, quote_type=q_type)
+                        ShioajiSDKCompat.subscribe(self._api, contract, quote_type=q_type_tick)
                         self._subscribed_tick_symbols.add(clean_sym)
                         logger.info(f"Subscribed Tick for {clean_sym}")
 
                     # 2. Subscribe BidAsk
                     if clean_sym not in self._subscribed_bidask_symbols:
-                        quote_type_bidask = getattr(sj_const, "QuoteType", None)
-                        q_type = getattr(quote_type_bidask, "BidAsk", "bidask") if quote_type_bidask else "bidask"
-                        self._api.quote.subscribe(contract, quote_type=q_type)
+                        ShioajiSDKCompat.subscribe(self._api, contract, quote_type=q_type_bidask)
                         self._subscribed_bidask_symbols.add(clean_sym)
                         logger.info(f"Subscribed BidAsk for {clean_sym}")
 
@@ -276,6 +390,10 @@ class ShioajiMarketDataSource(MarketDataSource):
     def unsubscribe(self, symbols: List[str]) -> None:
         """Fully unsubscribes both Tick and BidAsk streams for the given symbols."""
         with self._lock:
+            quote_type_enum = getattr(sj, "QuoteType", None) or getattr(sj_const, "QuoteType", None)
+            q_type_tick = getattr(quote_type_enum, "Tick", "tick") if quote_type_enum else "tick"
+            q_type_bidask = getattr(quote_type_enum, "BidAsk", "bidask") if quote_type_enum else "bidask"
+
             for sym in symbols:
                 clean_sym = sym.replace(".TW", "").replace(".TWO", "")
                 self._target_symbols.discard(clean_sym)
@@ -292,19 +410,19 @@ class ShioajiMarketDataSource(MarketDataSource):
 
                     # Unsubscribe Tick
                     if clean_sym in self._subscribed_tick_symbols:
-                        quote_type = getattr(sj_const, "QuoteType", None)
-                        q_type = getattr(quote_type, "Tick", "tick") if quote_type else "tick"
-                        if hasattr(self._api.quote, "unsubscribe"):
-                            self._api.quote.unsubscribe(contract, quote_type=q_type)
+                        try:
+                            ShioajiSDKCompat.unsubscribe(self._api, contract, quote_type=q_type_tick)
+                        except Exception as ex:
+                            logger.debug(f"Unsubscribe tick note for {clean_sym}: {ex}")
                         self._subscribed_tick_symbols.discard(clean_sym)
                         logger.info(f"Unsubscribed Tick for {clean_sym}")
 
                     # Unsubscribe BidAsk
                     if clean_sym in self._subscribed_bidask_symbols:
-                        quote_type = getattr(sj_const, "QuoteType", None)
-                        q_type = getattr(quote_type, "BidAsk", "bidask") if quote_type else "bidask"
-                        if hasattr(self._api.quote, "unsubscribe"):
-                            self._api.quote.unsubscribe(contract, quote_type=q_type)
+                        try:
+                            ShioajiSDKCompat.unsubscribe(self._api, contract, quote_type=q_type_bidask)
+                        except Exception as ex:
+                            logger.debug(f"Unsubscribe bidask note for {clean_sym}: {ex}")
                         self._subscribed_bidask_symbols.discard(clean_sym)
                         logger.info(f"Unsubscribed BidAsk for {clean_sym}")
 
@@ -433,6 +551,8 @@ class ShioajiMarketDataSource(MarketDataSource):
             with self._lock:
                 self._ticks_received_count += 1
                 self._last_tick_time = ts
+                if self._first_tick_time is None and not simtrade:
+                    self._first_tick_time = ts
                 callbacks = list(self._tick_callbacks)
 
             for cb in callbacks:
@@ -518,6 +638,8 @@ class ShioajiMarketDataSource(MarketDataSource):
             with self._lock:
                 self._bidask_received_count += 1
                 self._last_bidask_time = ts
+                if self._first_bidask_time is None and not simtrade:
+                    self._first_bidask_time = ts
                 callbacks = list(self._bidask_callbacks)
 
             for cb in callbacks:
@@ -569,10 +691,14 @@ class ShioajiMarketDataSource(MarketDataSource):
                 "source": "ShioajiMarketDataSource",
                 "state": self._state.value,
                 "connected": self.is_connected(),
+                "sdk_version": ShioajiSDKCompat.get_sdk_version(),
+                "simulation": self.simulation,
                 "subscribed_ticks": list(self._subscribed_tick_symbols),
                 "subscribed_bidask": list(self._subscribed_bidask_symbols),
                 "ticks_received": self._ticks_received_count,
                 "bidask_received": self._bidask_received_count,
+                "first_tick_time": self._first_tick_time.isoformat() if self._first_tick_time else None,
+                "first_bidask_time": self._first_bidask_time.isoformat() if self._first_bidask_time else None,
                 "malformed_payloads": self._malformed_payload_count,
                 "disconnects": self._disconnect_count,
                 "reconnects": self._reconnect_count,

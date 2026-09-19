@@ -94,11 +94,13 @@ class FakeQuote:
         self.on_event_callback = cb
 
     def subscribe(self, contract: FakeContract, quote_type: Any):
-        q_type_str = str(getattr(quote_type, "value", quote_type)).lower()
+        raw = str(getattr(quote_type, "value", quote_type)).lower()
+        q_type_str = "bidask" if ("bid" in raw or "ask" in raw) else "tick"
         self.subscriptions.add((contract.code, q_type_str))
 
     def unsubscribe(self, contract: FakeContract, quote_type: Any):
-        q_type_str = str(getattr(quote_type, "value", quote_type)).lower()
+        raw = str(getattr(quote_type, "value", quote_type)).lower()
+        q_type_str = "bidask" if ("bid" in raw or "ask" in raw) else "tick"
         self.subscriptions.discard((contract.code, q_type_str))
         self.unsubscriptions.add((contract.code, q_type_str))
 
@@ -167,14 +169,33 @@ class FakeContracts:
         }
 
 
+class FakeEmptyQuote:
+    """Represents modern Shioaji SDK (v1.5.x/v1.7.x) where api.quote does not expose methods."""
+    pass
+
+
 class FakeShioajiAPI:
-    """High-fidelity mock of Shioaji API instance."""
-    def __init__(self, simulation: bool = True):
+    """
+    High-fidelity mock of Shioaji API instance.
+    Supports both modern top-level methods (authoritative) and legacy .quote methods.
+    """
+    def __init__(self, simulation: bool = True, pure_modern: bool = False):
         self.simulation = simulation
-        self.quote = FakeQuote()
+        self.pure_modern = pure_modern
+        if pure_modern:
+            self.quote = FakeEmptyQuote()
+        else:
+            self.quote = FakeQuote()
         self.Contracts = FakeContracts()
         self._logged_in = False
         self.place_order_call_count = 0
+
+        # Modern top-level callback and subscription registries
+        self._on_tick_callback: Optional[Callable] = None
+        self._on_bidask_callback: Optional[Callable] = None
+        self._on_event_callback: Optional[Callable] = None
+        self.subscriptions: Set[tuple] = set()
+        self.unsubscriptions: Set[tuple] = set()
 
     def login(self, api_key: str, secret_key: str, contracts_cb: Optional[Callable] = None) -> List[Any]:
         if not api_key or not secret_key:
@@ -184,6 +205,93 @@ class FakeShioajiAPI:
 
     def logout(self) -> None:
         self._logged_in = False
+
+    def set_on_tick_stk_v1_callback(self, cb: Callable, bind: bool = False):
+        self._on_tick_callback = cb
+        if hasattr(self.quote, "set_on_tick_stk_v1_callback"):
+            self.quote.set_on_tick_stk_v1_callback(cb)
+
+    def set_on_bidask_stk_v1_callback(self, cb: Callable, bind: bool = False):
+        self._on_bidask_callback = cb
+        if hasattr(self.quote, "set_on_bidask_stk_v1_callback"):
+            self.quote.set_on_bidask_stk_v1_callback(cb)
+
+    def set_event_callback(self, cb: Callable):
+        self._on_event_callback = cb
+        if hasattr(self.quote, "set_event_callback"):
+            self.quote.set_event_callback(cb)
+
+    def subscribe(self, contract: Any, quote_type: Any, **kwargs):
+        raw = str(getattr(quote_type, "value", quote_type)).lower()
+        q_type_str = "bidask" if ("bid" in raw or "ask" in raw) else "tick"
+        self.subscriptions.add((contract.code, q_type_str))
+        if hasattr(self.quote, "subscribe"):
+            self.quote.subscribe(contract, quote_type)
+
+    def unsubscribe(self, contract: Any, quote_type: Any, **kwargs):
+        raw = str(getattr(quote_type, "value", quote_type)).lower()
+        q_type_str = "bidask" if ("bid" in raw or "ask" in raw) else "tick"
+        self.subscriptions.discard((contract.code, q_type_str))
+        self.unsubscriptions.add((contract.code, q_type_str))
+        if hasattr(self.quote, "unsubscribe"):
+            self.quote.unsubscribe(contract, quote_type)
+
+    def emit_tick(
+        self,
+        code: str,
+        price: float,
+        volume: int = 10,
+        total_volume: int = 500,
+        timestamp: Optional[datetime] = None,
+        tick_type: int = 1,
+        simtrade: bool = False,
+        intraday_odd: bool = False,
+    ):
+        cb = self._on_tick_callback or getattr(self.quote, "on_tick_callback", None)
+        if not cb:
+            raise RuntimeError("Cannot emit tick: set_on_tick_stk_v1_callback was never called!")
+        ts = timestamp or datetime.now(TAIPEI_TZ)
+        tick_obj = FakeTickSTKv1(
+            code=code,
+            datetime_val=ts,
+            close=Decimal(str(price)),
+            volume=volume,
+            total_volume=total_volume,
+            tick_type=tick_type,
+            simtrade=simtrade,
+            intraday_odd=intraday_odd,
+        )
+        cb(FakeExchange.TSE, tick_obj)
+
+    def emit_bidask(
+        self,
+        code: str,
+        bid_price: float,
+        ask_price: float,
+        bid_volume: int = 50,
+        ask_volume: int = 50,
+        timestamp: Optional[datetime] = None,
+        simtrade: bool = False,
+    ):
+        cb = self._on_bidask_callback or getattr(self.quote, "on_bidask_callback", None)
+        if not cb:
+            raise RuntimeError("Cannot emit bidask: set_on_bidask_stk_v1_callback was never called!")
+        ts = timestamp or datetime.now(TAIPEI_TZ)
+        bidask_obj = FakeBidAskSTKv1(
+            code=code,
+            datetime_val=ts,
+            bid_price=[Decimal(str(bid_price)), Decimal(str(bid_price - 1.0))],
+            bid_volume=[bid_volume, bid_volume * 2],
+            ask_price=[Decimal(str(ask_price)), Decimal(str(ask_price + 1.0))],
+            ask_volume=[ask_volume, ask_volume * 2],
+            simtrade=simtrade,
+        )
+        cb(FakeExchange.TSE, bidask_obj)
+
+    def emit_event(self, resp_code: int, event_code: int, info: str, event: str):
+        cb = self._on_event_callback or getattr(self.quote, "on_event_callback", None)
+        if cb:
+            cb(resp_code, event_code, info, event)
 
     def place_order(self, contract: Any, order: Any) -> Any:
         self.place_order_call_count += 1

@@ -76,6 +76,10 @@ class ShioajiBrokerAdapter(BrokerAdapter):
             return True
 
         if not self.api_key or not self.secret_key:
+            if self.trading_mode != "live":
+                print("Notice: Operating in mock/isolated adapter mode without credentials.")
+                self._connected = True
+                return True
             raise ValueError(
                 "Shioaji credentials missing. Provide SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY via environment."
             )

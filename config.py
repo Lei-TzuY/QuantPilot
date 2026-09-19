@@ -6,6 +6,14 @@ import os
 from datetime import timedelta
 
 
+try:
+    from dotenv import load_dotenv
+    # Explicitly load .env file; OS environment variables remain authoritative (override=False)
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
+
 class Config:
     """基礎配置"""
     # Flask設定
@@ -90,26 +98,52 @@ class Config:
     RISK_MAX_PRICE_DEVIATION_PCT = float(os.getenv("RISK_MAX_PRICE_DEVIATION_PCT", "0.08"))
     RISK_MAX_STALE_DATA_SECONDS = float(os.getenv("RISK_MAX_STALE_DATA_SECONDS", "60.0"))
 
-    # 永豐 Shioaji 券商與行情設定 (Shioaji Settings)
+    # 永豐 Shioaji 券商與行情設定 (Shioaji Settings with Official Alias Support)
+    # Precedence: SHIOAJI_API_KEY > SJ_API_KEY
+    # Precedence: SHIOAJI_SECRET_KEY > SJ_SEC_KEY
+    # Precedence: SHIOAJI_SIMULATION > SJ_SIMULATION
     MARKET_DATA_SOURCE = os.getenv("MARKET_DATA_SOURCE", "synthetic").lower()  # synthetic, shioaji, parquet_replay
-    SHIOAJI_API_KEY = os.getenv("SHIOAJI_API_KEY", "")
-    SHIOAJI_SECRET_KEY = os.getenv("SHIOAJI_SECRET_KEY", "")
+    SHIOAJI_API_KEY = os.getenv("SHIOAJI_API_KEY") or os.getenv("SJ_API_KEY", "")
+    SHIOAJI_SECRET_KEY = os.getenv("SHIOAJI_SECRET_KEY") or os.getenv("SJ_SEC_KEY", "")
     SHIOAJI_CERT_PATH = os.getenv("SHIOAJI_CERT_PATH", "")
     SHIOAJI_CERT_PASSWORD = os.getenv("SHIOAJI_CERT_PASSWORD", "")
     SHIOAJI_PERSON_ID = os.getenv("SHIOAJI_PERSON_ID", "")
-    SHIOAJI_SIMULATION = os.getenv("SHIOAJI_SIMULATION", "True").lower() == "true"
+    SHIOAJI_SIMULATION = (
+        os.getenv("SHIOAJI_SIMULATION") if os.getenv("SHIOAJI_SIMULATION") is not None
+        else os.getenv("SJ_SIMULATION", "True")
+    ).lower() == "true"
+
+    @classmethod
+    def get_api_key(cls) -> str:
+        """Returns active API key respecting SHIOAJI_API_KEY > SJ_API_KEY precedence."""
+        return os.getenv("SHIOAJI_API_KEY") or os.getenv("SJ_API_KEY") or cls.SHIOAJI_API_KEY or ""
+
+    @classmethod
+    def get_secret_key(cls) -> str:
+        """Returns active secret key respecting SHIOAJI_SECRET_KEY > SJ_SEC_KEY precedence."""
+        return os.getenv("SHIOAJI_SECRET_KEY") or os.getenv("SJ_SEC_KEY") or cls.SHIOAJI_SECRET_KEY or ""
+
+    @classmethod
+    def get_simulation_mode(cls) -> bool:
+        """Returns active simulation flag respecting SHIOAJI_SIMULATION > SJ_SIMULATION precedence."""
+        val = os.getenv("SHIOAJI_SIMULATION")
+        if val is None:
+            val = os.getenv("SJ_SIMULATION")
+        if val is not None:
+            return val.lower() == "true"
+        return cls.SHIOAJI_SIMULATION
 
     @classmethod
     def get_masked_shioaji_config(cls) -> dict:
         """Returns safe representation of Shioaji configuration with masked secrets."""
-        key = cls.SHIOAJI_API_KEY
+        key = cls.get_api_key()
         masked_key = f"{key[:4]}***{key[-4:]}" if len(key) >= 8 else ("***" if key else "")
         return {
             "market_data_source": cls.MARKET_DATA_SOURCE,
-            "api_key_configured": bool(cls.SHIOAJI_API_KEY),
+            "api_key_configured": bool(key),
             "api_key_masked": masked_key,
-            "secret_key_configured": bool(cls.SHIOAJI_SECRET_KEY),
-            "simulation": cls.SHIOAJI_SIMULATION,
+            "secret_key_configured": bool(cls.get_secret_key()),
+            "simulation": cls.get_simulation_mode(),
             "ca_cert_configured": bool(cls.SHIOAJI_CERT_PATH),
         }
 

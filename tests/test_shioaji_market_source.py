@@ -692,6 +692,247 @@ class TestShioajiMarketDataSource(unittest.TestCase):
         self.assertNotIn("SUPER_CONFIDENTIAL_SECRET_XYZ", output)
         self.assertIn("MY_S***1234", output)
 
+    def test_16_modern_sdk_top_level_methods(self):
+        """
+        Tests current Shioaji SDK (v1.5.x - v1.7.5) top-level API where:
+        - api.set_on_tick_stk_v1_callback
+        - api.set_on_bidask_stk_v1_callback
+        - api.set_event_callback
+        - api.subscribe
+        - api.unsubscribe
+        are top-level methods, and api.quote does NOT expose them.
+        """
+        from tests.fake_shioaji import FakeShioajiAPI
+        from modules.market.shioaji_source import ShioajiSDKCompat
+
+        # pure_modern=True: api.quote is an empty object without methods
+        modern_api = FakeShioajiAPI(pure_modern=True)
+        self.assertFalse(hasattr(modern_api.quote, "set_on_tick_stk_v1_callback"))
+        self.assertFalse(hasattr(modern_api.quote, "subscribe"))
+        self.assertFalse(hasattr(modern_api.quote, "unsubscribe"))
+
+        source = ShioajiMarketDataSource(api_instance=modern_api)
+        ticks: List[TickEvent] = []
+        bidasks: List[BidAskEvent] = []
+        source.register_tick_callback(lambda e: ticks.append(e))
+        source.register_bidask_callback(lambda e: bidasks.append(e))
+
+        self.assertTrue(source.connect())
+        source.subscribe(["2330"])
+
+        self.assertIn(("2330", "tick"), modern_api.subscriptions)
+        self.assertIn(("2330", "bidask"), modern_api.subscriptions)
+
+        # Emit tick and bidask via modern top-level methods
+        now = datetime.now(TAIPEI_TZ)
+        modern_api.emit_tick("2330", 980.0, volume=15, timestamp=now)
+        modern_api.emit_bidask("2330", 979.0, 981.0, timestamp=now)
+
+        self.assertEqual(len(ticks), 1)
+        self.assertEqual(ticks[0].price, 980.0)
+        self.assertEqual(ticks[0].volume, 15.0)
+
+        self.assertEqual(len(bidasks), 1)
+        self.assertEqual(bidasks[0].bid_price, 979.0)
+        self.assertEqual(bidasks[0].ask_price, 981.0)
+
+        # Test modern unsubscribe
+        source.unsubscribe(["2330"])
+        self.assertIn(("2330", "tick"), modern_api.unsubscriptions)
+        self.assertIn(("2330", "bidask"), modern_api.unsubscriptions)
+
+    def test_17_legacy_quote_fallback(self):
+        """Tests backwards compatibility fallback when only api.quote exposes methods."""
+        from tests.fake_shioaji import FakeQuote, FakeContracts
+        from modules.market.shioaji_source import ShioajiSDKCompat
+
+        class LegacyAPI:
+            def __init__(self):
+                self.quote = FakeQuote()
+                self.Contracts = FakeContracts()
+            def login(self, *a, **k):
+                return [self]
+
+        legacy_api = LegacyAPI()
+        # Ensure legacy_api does NOT have top-level methods
+        self.assertFalse(hasattr(legacy_api, "set_on_tick_stk_v1_callback"))
+        self.assertFalse(hasattr(legacy_api, "subscribe"))
+
+        source = ShioajiMarketDataSource(api_instance=legacy_api)
+        ticks: List[TickEvent] = []
+        source.register_tick_callback(lambda e: ticks.append(e))
+        source.connect()
+        source.subscribe(["2330"])
+
+        self.assertIn(("2330", "tick"), legacy_api.quote.subscriptions)
+        self.assertIn(("2330", "bidask"), legacy_api.quote.subscriptions)
+
+        legacy_api.quote.emit_tick("2330", 975.0, volume=5)
+        self.assertEqual(len(ticks), 1)
+        self.assertEqual(ticks[0].price, 975.0)
+
+    def test_18_dotenv_loading_and_credential_aliases(self):
+        """Tests .env loading and credential alias precedence: SHIOAJI_* > SJ_*."""
+        from config import Config
+
+        # 1. SHIOAJI_API_KEY takes precedence over SJ_API_KEY
+        with unittest.mock.patch.dict(os.environ, {
+            "SHIOAJI_API_KEY": "PRIMARY_KEY",
+            "SJ_API_KEY": "SECONDARY_KEY",
+            "SHIOAJI_SECRET_KEY": "PRIMARY_SEC",
+            "SJ_SEC_KEY": "SECONDARY_SEC",
+            "SHIOAJI_SIMULATION": "False",
+            "SJ_SIMULATION": "True",
+        }):
+            self.assertEqual(Config.get_api_key(), "PRIMARY_KEY")
+            self.assertEqual(Config.get_secret_key(), "PRIMARY_SEC")
+            self.assertFalse(Config.get_simulation_mode())
+
+        # 2. SJ_* fallback when SHIOAJI_* is absent
+        with unittest.mock.patch.dict(os.environ, {
+            "SHIOAJI_API_KEY": "",
+            "SJ_API_KEY": "FALLBACK_KEY",
+            "SHIOAJI_SECRET_KEY": "",
+            "SJ_SEC_KEY": "FALLBACK_SEC",
+            "SHIOAJI_SIMULATION": "",
+            "SJ_SIMULATION": "False",
+        }):
+            self.assertEqual(Config.get_api_key(), "FALLBACK_KEY")
+            self.assertEqual(Config.get_secret_key(), "FALLBACK_SEC")
+            self.assertFalse(Config.get_simulation_mode())
+
+        # 3. ShioajiMarketDataSource respects alias fallback
+        with unittest.mock.patch.dict(os.environ, {
+            "SHIOAJI_API_KEY": "",
+            "SJ_API_KEY": "SJ_KEY_123",
+            "SHIOAJI_SECRET_KEY": "",
+            "SJ_SEC_KEY": "SJ_SEC_456",
+        }):
+            ds = ShioajiMarketDataSource()
+            self.assertEqual(ds.api_key, "SJ_KEY_123")
+            self.assertEqual(ds.secret_key, "SJ_SEC_456")
+
+    def test_19_runner_fatal_exit_codes(self):
+        """Tests that runner returns non-zero exit code (1) on fatal failures."""
+        from scripts.run_shioaji_shadow import run_shioaji_shadow
+
+        # 1. Fatal startup error: missing credentials
+        with unittest.mock.patch.dict(os.environ, {"SHIOAJI_API_KEY": "", "SJ_API_KEY": "", "SHIOAJI_SECRET_KEY": "", "SJ_SEC_KEY": ""}):
+            ret = run_shioaji_shadow(symbols=["2330"], api_key="", secret_key="")
+            self.assertEqual(ret, 1)
+
+        # 2. Fatal connection error
+        with unittest.mock.patch.object(ShioajiMarketDataSource, "connect", return_value=False):
+            ret = run_shioaji_shadow(
+                symbols=["2330"],
+                api_key="TEST_KEY",
+                secret_key="TEST_SEC",
+                simulation=True,
+            )
+            self.assertEqual(ret, 1)
+
+        # 3. Fatal subscription error: mismatch reported
+        with unittest.mock.patch.object(ShioajiMarketDataSource, "connect", return_value=True), \
+             unittest.mock.patch.object(ShioajiMarketDataSource, "is_connected", return_value=True), \
+             unittest.mock.patch.object(ShioajiMarketDataSource, "subscribe", side_effect=RuntimeError("Sub failed")):
+            ret = run_shioaji_shadow(
+                symbols=["2330"],
+                api_key="TEST_KEY",
+                secret_key="TEST_SEC",
+                simulation=True,
+            )
+            self.assertEqual(ret, 1)
+
+    def test_20_real_feed_verification_state_progression(self):
+        """
+        Proves real-feed verification requires genuine Tick + BidAsk events.
+        Login and subscription alone CANNOT claim REAL_FEED_STREAMING or REAL_FEED_COMPLETED.
+        """
+        from scripts.run_shioaji_shadow import VerificationState
+        from tests.fake_shioaji import FakeShioajiAPI
+
+        fake_api = FakeShioajiAPI(pure_modern=True)
+        source = ShioajiMarketDataSource(
+            api_key="TEST_KEY",
+            secret_key="TEST_SEC",
+            simulation=False,
+            api_instance=fake_api,
+        )
+        source.connect()
+        source.subscribe(["2330"])
+
+        # Initial state before genuine market events
+        verification_state = VerificationState.REAL_FEED_CONNECTING
+        self.assertFalse(source.has_received_genuine_events())
+        self.assertEqual(verification_state, VerificationState.REAL_FEED_CONNECTING)
+
+        # 1. Tick alone does NOT allow claiming REAL_FEED_STREAMING
+        fake_api.emit_tick("2330", 990.0, volume=10)
+        self.assertFalse(source.has_received_genuine_events())
+        if source.has_received_genuine_events():
+            verification_state = VerificationState.REAL_FEED_STREAMING
+        self.assertEqual(verification_state, VerificationState.REAL_FEED_CONNECTING)
+
+        # 2. Both Tick AND BidAsk received -> state can transition to REAL_FEED_STREAMING
+        fake_api.emit_bidask("2330", 989.0, 991.0)
+        self.assertTrue(source.has_received_genuine_events())
+        if source.has_received_genuine_events():
+            verification_state = VerificationState.REAL_FEED_STREAMING
+        self.assertEqual(verification_state, VerificationState.REAL_FEED_STREAMING)
+
+        # 3. Clean shutdown with genuine events completes verification
+        clean_shutdown = True
+        fatal_error = False
+        if clean_shutdown and not fatal_error and verification_state == VerificationState.REAL_FEED_STREAMING:
+            verification_state = VerificationState.REAL_FEED_COMPLETED
+        self.assertEqual(verification_state, VerificationState.REAL_FEED_COMPLETED)
+
+    def test_21_preflight_mode_safe_output(self):
+        """Tests preflight check output and status codes."""
+        import io
+        import contextlib
+        from scripts.run_shioaji_shadow import run_preflight
+
+        # 1. Simulation preflight with missing creds passes safely
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = run_preflight(symbols=["2330"], simulation=True, api_key="", secret_key="")
+        out = buf.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("Shioaji SDK:", out)
+        self.assertIn("Feed: SIMULATION", out)
+        self.assertIn("Execution: PAPER (PaperBrokerAdapter)", out)
+        self.assertIn("Live orders: DISABLED", out)
+
+        # 2. Production preflight without creds returns 1
+        code_prod_fail = run_preflight(symbols=["2330"], simulation=False, api_key="", secret_key="")
+        self.assertEqual(code_prod_fail, 1)
+
+        # 3. Production preflight with configured creds returns 0 without leaking them
+        buf_prod = io.StringIO()
+        with contextlib.redirect_stdout(buf_prod):
+            code_prod_ok = run_preflight(
+                symbols=["2330"],
+                simulation=False,
+                api_key="SUPER_SECRET_PROD_KEY",
+                secret_key="SUPER_SECRET_PROD_SECRET",
+            )
+        out_prod = buf_prod.getvalue()
+        self.assertEqual(code_prod_ok, 0)
+        self.assertIn("Feed: PRODUCTION", out_prod)
+        self.assertIn("Credentials: configured", out_prod)
+        self.assertNotIn("SUPER_SECRET_PROD_KEY", out_prod)
+        self.assertNotIn("SUPER_SECRET_PROD_SECRET", out_prod)
+
+    def test_22_sdk_compat_version_reporting(self):
+        """Tests ShioajiSDKCompat version reporting and fallback."""
+        from modules.market.shioaji_source import ShioajiSDKCompat
+
+        ver = ShioajiSDKCompat.get_sdk_version()
+        self.assertIsInstance(ver, str)
+        self.assertTrue(len(ver) > 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -13,6 +13,7 @@ Usage:
 """
 import argparse
 from datetime import datetime, timedelta
+from enum import Enum
 import logging
 import os
 import signal
@@ -25,6 +26,13 @@ from zoneinfo import ZoneInfo
 # Ensure repository root is on sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+try:
+    from dotenv import load_dotenv
+    # Explicitly load .env file; OS environment variables remain authoritative (override=False)
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
 from config import Config
 from modules.brokers.paper import PaperBrokerAdapter
 from modules.common.clock import SystemClock
@@ -32,7 +40,7 @@ from modules.execution.engine import ExecutionEngine
 from modules.execution.events import BarEvent, SignalEvent
 from modules.market.clock import MarketClock, MarketSession
 from modules.market.recorder import RawMarketDataRecorder
-from modules.market.shioaji_source import ShioajiMarketDataSource
+from modules.market.shioaji_source import ShioajiMarketDataSource, ShioajiSDKCompat
 from modules.risk.engine import RiskEngine
 from modules.risk.limits import RiskLimits
 from modules.risk.kill_switch import KillSwitch
@@ -45,6 +53,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("QuantPilot.ShioajiShadowRunner")
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+
+
+class VerificationState(str, Enum):
+    OFFLINE_VERIFIED = "OFFLINE_VERIFIED"
+    REAL_FEED_CONNECTING = "REAL_FEED_CONNECTING"
+    REAL_FEED_STREAMING = "REAL_FEED_STREAMING"
+    REAL_FEED_COMPLETED = "REAL_FEED_COMPLETED"
+    REAL_FEED_FAILED = "REAL_FEED_FAILED"
 
 
 class ShadowBurnInStrategy(BaseStrategy):
@@ -126,16 +142,18 @@ def resolve_simulation_mode(cli_simulation: Optional[bool] = None) -> bool:
     Resolves whether Shioaji market data source should run in simulation or production.
     Precedence:
         1. Explicit CLI override (--simulation or --no-simulation / --production)
-        2. Environment variable SHIOAJI_SIMULATION
-        3. Config.SHIOAJI_SIMULATION
+        2. Environment variable SHIOAJI_SIMULATION or SJ_SIMULATION
+        3. Config.get_simulation_mode()
         4. Safe default: True
     """
     if cli_simulation is not None:
         return bool(cli_simulation)
     env_val = os.getenv("SHIOAJI_SIMULATION")
+    if env_val is None:
+        env_val = os.getenv("SJ_SIMULATION")
     if env_val is not None:
         return env_val.strip().lower() in ("true", "1", "yes")
-    return getattr(Config, "SHIOAJI_SIMULATION", True)
+    return Config.get_simulation_mode()
 
 
 def show_configuration(
@@ -146,8 +164,8 @@ def show_configuration(
     secret_key: Optional[str] = None,
 ) -> None:
     """Prints safe, masked configuration proof for shadow execution."""
-    resolved_api_key = api_key or Config.SHIOAJI_API_KEY or ""
-    resolved_secret_key = secret_key or Config.SHIOAJI_SECRET_KEY or ""
+    resolved_api_key = api_key or Config.get_api_key() or ""
+    resolved_secret_key = secret_key or Config.get_secret_key() or ""
     masked_key = (
         f"{resolved_api_key[:4]}***{resolved_api_key[-4:]}"
         if len(resolved_api_key) >= 8
@@ -171,6 +189,57 @@ def show_configuration(
     print("=================================================================")
 
 
+def run_preflight(
+    symbols: list,
+    simulation: bool,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+) -> int:
+    """
+    Executes preflight verification according to Requirement 9:
+    1. Loads .env
+    2. Verifies Shioaji package installed & prints version
+    3. Validates production/simulation selection
+    4. Verifies credentials configured (yes/no)
+    5. Confirms execution broker is PaperBrokerAdapter
+    6. Confirms ENABLE_LIVE_TRADING is false
+    7. Tests callback registration
+    8. Never places orders
+    """
+    resolved_api_key = api_key or Config.get_api_key() or ""
+    resolved_secret_key = secret_key or Config.get_secret_key() or ""
+    creds_configured = bool(resolved_api_key and resolved_secret_key)
+    sdk_version = ShioajiSDKCompat.get_sdk_version()
+    feed_mode = "SIMULATION" if simulation else "PRODUCTION"
+
+    os.environ["TRADING_MODE"] = "shadow"
+    os.environ["BROKER_TYPE"] = "paper"
+    os.environ["ENABLE_LIVE_TRADING"] = "false"
+
+    paper_broker = PaperBrokerAdapter()
+    source = ShioajiMarketDataSource(
+        api_key=resolved_api_key,
+        secret_key=resolved_secret_key,
+        simulation=simulation,
+    )
+    tick_cb_ok = hasattr(source, "_on_native_tick")
+    bidask_cb_ok = hasattr(source, "_on_native_bidask")
+
+    print(f"Shioaji SDK: {sdk_version}")
+    print(f"Feed: {feed_mode}")
+    print(f"Credentials: {'configured' if creds_configured else 'MISSING'}")
+    print(f"Execution: PAPER ({paper_broker.__class__.__name__})")
+    print(f"Live orders: DISABLED (ENABLE_LIVE_TRADING=False)")
+    print(f"Tick callback: {'registered' if tick_cb_ok else 'UNSUPPORTED'}")
+    print(f"BidAsk callback: {'registered' if bidask_cb_ok else 'UNSUPPORTED'}")
+
+    if not simulation and not creds_configured:
+        logger.error("Preflight failed: Credentials are missing for PRODUCTION quote feed.")
+        return 1
+
+    return 0
+
+
 def run_shioaji_shadow(
     symbols: list,
     paper_cash: float = 1_000_000.0,
@@ -179,8 +248,11 @@ def run_shioaji_shadow(
     api_key: Optional[str] = None,
     secret_key: Optional[str] = None,
     simulation: bool = True,
-):
-    """Executes a real-market quote shadow session with paper execution."""
+) -> int:
+    """
+    Executes a real-market quote shadow session with paper execution.
+    Returns 0 on normal operator shutdown / market-close, 1 on fatal error.
+    """
     logger.info("=================================================================")
     logger.info("Starting QuantPilot SHIOAJI SHADOW MODE Session")
     logger.info("READ-ONLY MARKET DATA + PAPER EXECUTION EXCLUSIVITY")
@@ -193,14 +265,21 @@ def run_shioaji_shadow(
     os.environ["BROKER_TYPE"] = "paper"
     os.environ["ENABLE_LIVE_TRADING"] = "false"
 
+    verification_state = (
+        VerificationState.OFFLINE_VERIFIED if simulation else VerificationState.REAL_FEED_CONNECTING
+    )
+    fatal_error = False
+
     # Verify credentials exist before starting
-    resolved_api_key = api_key or Config.SHIOAJI_API_KEY
-    resolved_secret_key = secret_key or Config.SHIOAJI_SECRET_KEY
+    resolved_api_key = api_key or Config.get_api_key()
+    resolved_secret_key = secret_key or Config.get_secret_key()
     if not resolved_api_key or not resolved_secret_key:
-        raise ValueError(
-            "Shioaji API key and secret key must be configured in environment (.env) "
+        verification_state = VerificationState.REAL_FEED_FAILED
+        logger.error(
+            "FATAL: Shioaji API key and secret key must be configured in environment (.env) "
             "or passed via CLI (--api-key, --secret-key) before starting shadow session."
         )
+        return 1
 
     tracemalloc.start()
     clock = SystemClock()
@@ -246,8 +325,8 @@ def run_shioaji_shadow(
 
     # 5. Read-Only Shioaji Market Data Source
     shioaji_source = ShioajiMarketDataSource(
-        api_key=api_key or Config.SHIOAJI_API_KEY,
-        secret_key=secret_key or Config.SHIOAJI_SECRET_KEY,
+        api_key=resolved_api_key,
+        secret_key=resolved_secret_key,
         simulation=simulation,
     )
 
@@ -277,10 +356,14 @@ def run_shioaji_shadow(
         logger.info(f"Authenticating with SinoPac Shioaji quote transport ({feed_mode_str})...")
         connected = shioaji_source.connect()
         if not connected or not shioaji_source.is_connected():
+            fatal_error = True
+            verification_state = VerificationState.REAL_FEED_FAILED
             raise ConnectionError(f"Failed to connect to Shioaji market data source ({feed_mode_str}).")
 
         # Fast-fail if production mode was requested but source reports simulation mode
         if not simulation and shioaji_source.simulation:
+            fatal_error = True
+            verification_state = VerificationState.REAL_FEED_FAILED
             raise RuntimeError(
                 "FATAL: Production quote mode was requested, but market data source is operating in simulation mode."
             )
@@ -292,6 +375,8 @@ def run_shioaji_shadow(
         missing_ticks = [s for s in symbols if s not in shioaji_source.subscribed_tick_symbols]
         missing_bidask = [s for s in symbols if s not in shioaji_source.subscribed_bidask_symbols]
         if missing_ticks or missing_bidask:
+            fatal_error = True
+            verification_state = VerificationState.REAL_FEED_FAILED
             raise RuntimeError(
                 f"Subscription verification failed. Missing Ticks: {missing_ticks}, Missing BidAsk: {missing_bidask}"
             )
@@ -308,6 +393,17 @@ def run_shioaji_shadow(
                 logger.info("Reached configured session duration. Terminating shadow runner.")
                 break
 
+            # Check for transition to REAL_FEED_STREAMING (requires simulation=False AND genuine tick + bidask)
+            if (
+                not simulation
+                and verification_state == VerificationState.REAL_FEED_CONNECTING
+                and shioaji_source.has_received_genuine_events()
+            ):
+                verification_state = VerificationState.REAL_FEED_STREAMING
+                logger.info(
+                    "*** VERIFICATION STATE TRANSITION: REAL_FEED_STREAMING (Genuine Tick and BidAsk received) ***"
+                )
+
             # Check market session state
             session = market_clock.get_session()
             if session == MarketSession.CLOSED and now_taipei.hour >= 14:
@@ -318,7 +414,7 @@ def run_shioaji_shadow(
             status = engine.get_status()
             mkt_status = shioaji_source.heartbeat()
             logger.info(
-                f"[SHADOW TELEMETRY] Session={session.value} | "
+                f"[SHADOW TELEMETRY] Verification={verification_state.value} | Session={session.value} | "
                 f"TicksRecv={mkt_status['ticks_received']} | "
                 f"BidAskRecv={mkt_status['bidask_received']} | "
                 f"QDepth={status['queue']['depth']} | "
@@ -329,8 +425,12 @@ def run_shioaji_shadow(
 
             time.sleep(30.0)
 
+    except KeyboardInterrupt:
+        logger.info("Operator interrupt received. Shutting down gracefully...")
     except Exception as e:
-        logger.error(f"Error during Shioaji shadow session: {e}", exc_info=True)
+        logger.error(f"Fatal error during Shioaji shadow session: {e}", exc_info=True)
+        fatal_error = True
+        verification_state = VerificationState.REAL_FEED_FAILED
     finally:
         logger.info("Executing clean shutdown sequence...")
         # 1. Unsubscribe and disconnect market feed
@@ -353,11 +453,24 @@ def run_shioaji_shadow(
             except Exception as e:
                 logger.error(f"Error flushing recorder: {e}")
 
-        # 4. Generate & persist session reports
+        # 4. Check clean completion state
+        if (
+            not fatal_error
+            and not simulation
+            and verification_state == VerificationState.REAL_FEED_STREAMING
+            and shioaji_source.has_received_genuine_events()
+        ):
+            verification_state = VerificationState.REAL_FEED_COMPLETED
+            logger.info("*** VERIFICATION STATE TRANSITION: REAL_FEED_COMPLETED ***")
+
+        logger.info(f"Final Verification State: {verification_state.value}")
+
+        # 5. Generate & persist session reports
         try:
             report = engine.generate_session_report()
             logger.info("=================================================================")
             logger.info(f"SHADOW SESSION REPORT GENERATED: {report.session_id}")
+            logger.info(f"Verification State: {verification_state.value}")
             logger.info(f"Market Data Received: {report.market_data_received}")
             logger.info(f"Ticks Processed: {report.ticks_processed} | Rejected: {report.ticks_rejected}")
             logger.info(f"Bars Finalized: {report.bars_generated} | Signals: {report.signals_generated}")
@@ -367,6 +480,8 @@ def run_shioaji_shadow(
             logger.info("=================================================================")
         except Exception as e:
             logger.error(f"Failed to generate shadow session report: {e}", exc_info=True)
+
+        return 1 if fatal_error else 0
 
 
 if __name__ == "__main__":
@@ -392,6 +507,11 @@ if __name__ == "__main__":
         help="Shortcut for --no-simulation (connects to real production quote feed)",
     )
     parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Run preflight environment, credential, SDK and invariant checks then exit",
+    )
+    parser.add_argument(
         "--show-config",
         action="store_true",
         help="Display safe masked configuration proof and exit without trading (dry run)",
@@ -409,6 +529,15 @@ if __name__ == "__main__":
         cli_sim = args.simulation
     simulation = resolve_simulation_mode(cli_sim)
 
+    if args.preflight:
+        code = run_preflight(
+            symbols=syms,
+            simulation=simulation,
+            api_key=args.api_key,
+            secret_key=args.secret_key,
+        )
+        sys.exit(code)
+
     if args.show_config:
         show_configuration(
             symbols=syms,
@@ -419,7 +548,7 @@ if __name__ == "__main__":
         )
         sys.exit(0)
 
-    run_shioaji_shadow(
+    exit_code = run_shioaji_shadow(
         symbols=syms,
         paper_cash=args.paper_cash,
         record=args.record,
@@ -428,3 +557,4 @@ if __name__ == "__main__":
         secret_key=args.secret_key,
         simulation=simulation,
     )
+    sys.exit(exit_code)

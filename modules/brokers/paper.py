@@ -277,6 +277,9 @@ class PaperBrokerAdapter(BrokerAdapter):
         self._notify_fill(fill)
 
         # Update order progress if not already updated by OMS fill listener
+        if fill not in order.fills:
+            order.fills.append(fill)
+
         if order.filled_quantity < new_filled:
             order.filled_quantity = new_filled
             order.remaining_quantity = new_remaining

@@ -9,9 +9,9 @@ import logging
 import queue
 import threading
 import time
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional, Union
 
-from modules.execution.events import TickEvent
+from modules.execution.events import BidAskEvent, TickEvent
 
 logger = logging.getLogger("QuantPilot.EventQueue")
 
@@ -30,7 +30,8 @@ class QueueMetrics:
 
 class MarketDataEventQueue:
     """
-    Bounded, thread-safe asynchronous queue for streaming tick ingestion.
+    Bounded, thread-safe asynchronous queue for streaming market event ingestion.
+    Supports both TickEvent and BidAskEvent streams.
     
     Guarantees:
     - Ingestion callback returns in microseconds without blocking.
@@ -46,7 +47,7 @@ class MarketDataEventQueue:
         name: str = "MarketDataQueue",
         synchronous: bool = False,
         test_only_synchronous: bool = False,
-        on_overflow: Optional[Callable[[TickEvent, QueueMetrics], None]] = None,
+        on_overflow: Optional[Callable[[Union[TickEvent, BidAskEvent], QueueMetrics], None]] = None,
     ):
         self.capacity = capacity
         self.name = name
@@ -65,14 +66,14 @@ class MarketDataEventQueue:
 
         self._consumer_thread: Optional[threading.Thread] = None
         self._is_running = False
-        self._subscribers: List[Callable[[TickEvent], None]] = []
+        self._subscribers: List[Callable[[Union[TickEvent, BidAskEvent]], None]] = []
 
-    def subscribe(self, callback: Callable[[TickEvent], None]) -> None:
-        """Subscribes downstream processor to dequeued ticks."""
+    def subscribe(self, callback: Callable[[Union[TickEvent, BidAskEvent]], None]) -> None:
+        """Subscribes downstream processor to dequeued market events."""
         with self._lock:
             self._subscribers.append(callback)
 
-    def enqueue(self, tick: TickEvent) -> bool:
+    def enqueue(self, event: Union[TickEvent, BidAskEvent]) -> bool:
         """
         Non-blocking enqueue for market callbacks.
         Attaches monotonic sequence number, enqueue wall timestamp, and monotonic nanoseconds.
@@ -83,59 +84,103 @@ class MarketDataEventQueue:
             self._seq_counter += 1
             seq = self._seq_counter
 
-        # Create updated TickEvent with sequence and enqueue timestamps
-        stamped_tick = TickEvent(
-            timestamp=tick.timestamp,
-            symbol=tick.symbol,
-            price=tick.price,
-            volume=tick.volume,
-            bid_price=tick.bid_price,
-            ask_price=tick.ask_price,
-            bid_volume=tick.bid_volume,
-            ask_volume=tick.ask_volume,
-            receive_timestamp=tick.receive_timestamp or now,
-            enqueue_timestamp=now,
-            enqueue_ns=now_ns,
-            sequence=seq,
-            tick_type=tick.tick_type,
-            source=tick.source,
-            simtrade=tick.simtrade,
-            is_replay=getattr(tick, "is_replay", False),
-        )
+        if isinstance(event, BidAskEvent):
+            stamped_event = BidAskEvent(
+                timestamp=event.timestamp,
+                symbol=event.symbol,
+                bid_price=event.bid_price,
+                ask_price=event.ask_price,
+                bid_volume=event.bid_volume,
+                ask_volume=event.ask_volume,
+                bid_depth=event.bid_depth,
+                ask_depth=event.ask_depth,
+                receive_timestamp=event.receive_timestamp or now,
+                enqueue_timestamp=now,
+                enqueue_ns=now_ns,
+                sequence=seq,
+                simtrade=event.simtrade,
+                source=event.source,
+                is_replay=getattr(event, "is_replay", False),
+            )
+        else:
+            # TickEvent
+            stamped_event = TickEvent(
+                timestamp=event.timestamp,
+                symbol=event.symbol,
+                price=event.price,
+                volume=event.volume,
+                total_volume=getattr(event, "total_volume", None),
+                bid_price=event.bid_price,
+                ask_price=event.ask_price,
+                bid_volume=event.bid_volume,
+                ask_volume=event.ask_volume,
+                receive_timestamp=event.receive_timestamp or now,
+                enqueue_timestamp=now,
+                enqueue_ns=now_ns,
+                sequence=seq,
+                tick_type=event.tick_type,
+                source=event.source,
+                simtrade=event.simtrade,
+                intraday_odd=getattr(event, "intraday_odd", False),
+                is_replay=getattr(event, "is_replay", False),
+            )
 
         if self.synchronous:
             with self._lock:
                 self._total_enqueued += 1
                 self._total_dequeued += 1
-            processed_tick = TickEvent(
-                timestamp=stamped_tick.timestamp,
-                symbol=stamped_tick.symbol,
-                price=stamped_tick.price,
-                volume=stamped_tick.volume,
-                bid_price=stamped_tick.bid_price,
-                ask_price=stamped_tick.ask_price,
-                bid_volume=stamped_tick.bid_volume,
-                ask_volume=stamped_tick.ask_volume,
-                receive_timestamp=stamped_tick.receive_timestamp,
-                enqueue_timestamp=stamped_tick.enqueue_timestamp,
-                dequeue_timestamp=datetime.now(),
-                enqueue_ns=stamped_tick.enqueue_ns,
-                dequeue_ns=time.perf_counter_ns(),
-                sequence=stamped_tick.sequence,
-                tick_type=stamped_tick.tick_type,
-                source=stamped_tick.source,
-                simtrade=stamped_tick.simtrade,
-                is_replay=stamped_tick.is_replay,
-            )
+            if isinstance(stamped_event, BidAskEvent):
+                processed_event = BidAskEvent(
+                    timestamp=stamped_event.timestamp,
+                    symbol=stamped_event.symbol,
+                    bid_price=stamped_event.bid_price,
+                    ask_price=stamped_event.ask_price,
+                    bid_volume=stamped_event.bid_volume,
+                    ask_volume=stamped_event.ask_volume,
+                    bid_depth=stamped_event.bid_depth,
+                    ask_depth=stamped_event.ask_depth,
+                    receive_timestamp=stamped_event.receive_timestamp,
+                    enqueue_timestamp=stamped_event.enqueue_timestamp,
+                    dequeue_timestamp=datetime.now(),
+                    enqueue_ns=stamped_event.enqueue_ns,
+                    dequeue_ns=time.perf_counter_ns(),
+                    sequence=stamped_event.sequence,
+                    simtrade=stamped_event.simtrade,
+                    source=stamped_event.source,
+                    is_replay=stamped_event.is_replay,
+                )
+            else:
+                processed_event = TickEvent(
+                    timestamp=stamped_event.timestamp,
+                    symbol=stamped_event.symbol,
+                    price=stamped_event.price,
+                    volume=stamped_event.volume,
+                    total_volume=stamped_event.total_volume,
+                    bid_price=stamped_event.bid_price,
+                    ask_price=stamped_event.ask_price,
+                    bid_volume=stamped_event.bid_volume,
+                    ask_volume=stamped_event.ask_volume,
+                    receive_timestamp=stamped_event.receive_timestamp,
+                    enqueue_timestamp=stamped_event.enqueue_timestamp,
+                    dequeue_timestamp=datetime.now(),
+                    enqueue_ns=stamped_event.enqueue_ns,
+                    dequeue_ns=time.perf_counter_ns(),
+                    sequence=stamped_event.sequence,
+                    tick_type=stamped_event.tick_type,
+                    source=stamped_event.source,
+                    simtrade=stamped_event.simtrade,
+                    intraday_odd=stamped_event.intraday_odd,
+                    is_replay=stamped_event.is_replay,
+                )
             for subscriber in list(self._subscribers):
                 try:
-                    subscriber(processed_tick)
+                    subscriber(processed_event)
                 except Exception as e:
                     logger.error(f"Error in queue subscriber callback: {e}", exc_info=True)
             return True
 
         try:
-            self._queue.put_nowait(stamped_tick)
+            self._queue.put_nowait(stamped_event)
             with self._lock:
                 self._total_enqueued += 1
                 # Enforce accounting: measure queue depth AFTER successful enqueue!
@@ -152,11 +197,11 @@ class MarketDataEventQueue:
 
             logger.critical(
                 f"[QUEUE OVERFLOW] MarketDataEventQueue '{self.name}' exceeded capacity {self.capacity}! "
-                f"Tick {tick.symbol}@{tick.price} dropped. Data stream marked UNHEALTHY."
+                f"Event {event.symbol} dropped. Data stream marked UNHEALTHY."
             )
             if self.on_overflow:
                 try:
-                    self.on_overflow(stamped_tick, metrics)
+                    self.on_overflow(stamped_event, metrics)
                 except Exception as e:
                     logger.error(f"Error in on_overflow callback: {e}")
             return False
@@ -208,10 +253,10 @@ class MarketDataEventQueue:
             self.drain(timeout=timeout)
 
     def _worker_loop(self) -> None:
-        """Consumer worker loop dispatching ticks to downstream subscribers."""
+        """Consumer worker loop dispatching market events to downstream subscribers."""
         while self._is_running or not self._queue.empty():
             try:
-                tick: TickEvent = self._queue.get(timeout=0.1)
+                event: Union[TickEvent, BidAskEvent] = self._queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -221,31 +266,54 @@ class MarketDataEventQueue:
                 self._total_dequeued += 1
 
             # Attach dequeue timestamp and monotonic nanoseconds
-            processed_tick = TickEvent(
-                timestamp=tick.timestamp,
-                symbol=tick.symbol,
-                price=tick.price,
-                volume=tick.volume,
-                bid_price=tick.bid_price,
-                ask_price=tick.ask_price,
-                bid_volume=tick.bid_volume,
-                ask_volume=tick.ask_volume,
-                receive_timestamp=tick.receive_timestamp,
-                enqueue_timestamp=tick.enqueue_timestamp,
-                dequeue_timestamp=dequeue_time,
-                enqueue_ns=tick.enqueue_ns,
-                dequeue_ns=dequeue_ns,
-                sequence=tick.sequence,
-                tick_type=tick.tick_type,
-                source=tick.source,
-                simtrade=tick.simtrade,
-                is_replay=getattr(tick, "is_replay", False),
-            )
+            if isinstance(event, BidAskEvent):
+                processed_event = BidAskEvent(
+                    timestamp=event.timestamp,
+                    symbol=event.symbol,
+                    bid_price=event.bid_price,
+                    ask_price=event.ask_price,
+                    bid_volume=event.bid_volume,
+                    ask_volume=event.ask_volume,
+                    bid_depth=event.bid_depth,
+                    ask_depth=event.ask_depth,
+                    receive_timestamp=event.receive_timestamp,
+                    enqueue_timestamp=event.enqueue_timestamp,
+                    dequeue_timestamp=dequeue_time,
+                    enqueue_ns=event.enqueue_ns,
+                    dequeue_ns=dequeue_ns,
+                    sequence=event.sequence,
+                    simtrade=event.simtrade,
+                    source=event.source,
+                    is_replay=getattr(event, "is_replay", False),
+                )
+            else:
+                processed_event = TickEvent(
+                    timestamp=event.timestamp,
+                    symbol=event.symbol,
+                    price=event.price,
+                    volume=event.volume,
+                    total_volume=getattr(event, "total_volume", None),
+                    bid_price=event.bid_price,
+                    ask_price=event.ask_price,
+                    bid_volume=event.bid_volume,
+                    ask_volume=event.ask_volume,
+                    receive_timestamp=event.receive_timestamp,
+                    enqueue_timestamp=event.enqueue_timestamp,
+                    dequeue_timestamp=dequeue_time,
+                    enqueue_ns=event.enqueue_ns,
+                    dequeue_ns=dequeue_ns,
+                    sequence=event.sequence,
+                    tick_type=event.tick_type,
+                    source=event.source,
+                    simtrade=event.simtrade,
+                    intraday_odd=getattr(event, "intraday_odd", False),
+                    is_replay=getattr(event, "is_replay", False),
+                )
 
             # Dispatch to subscribers
             for subscriber in list(self._subscribers):
                 try:
-                    subscriber(processed_tick)
+                    subscriber(processed_event)
                 except Exception as e:
                     logger.error(f"Error in queue subscriber callback: {e}", exc_info=True)
 

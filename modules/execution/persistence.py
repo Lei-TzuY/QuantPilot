@@ -138,6 +138,7 @@ class ExecutionStatePersistence:
                 )
                 orders.append(order)
 
+            order_map = {o.order_id: o for o in orders}
             fills: List[Fill] = []
             for f_data in raw.get("fills", []):
                 fill = Fill(
@@ -154,6 +155,8 @@ class ExecutionStatePersistence:
                     timestamp=datetime.fromisoformat(f_data["timestamp"]),
                 )
                 fills.append(fill)
+                if fill.order_id in order_map and fill not in order_map[fill.order_id].fills:
+                    order_map[fill.order_id].fills.append(fill)
 
             return {
                 "saved_at": raw.get("saved_at"),

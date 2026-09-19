@@ -6,7 +6,7 @@ from datetime import datetime
 import logging
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from modules.brokers.base import BrokerAdapter
 from modules.brokers.paper import PaperBrokerAdapter
@@ -14,6 +14,7 @@ from modules.common.clock import IClock, SystemClock
 from modules.execution.events import (
     AuditLogEntry,
     BarEvent,
+    BidAskEvent,
     EventType,
     RiskDecision,
     SignalEvent,
@@ -37,6 +38,7 @@ from modules.market.bar_builder import BarBuilder
 from modules.market.clock import MarketClock
 from modules.market.event_queue import MarketDataEventQueue, QueueMetrics
 from modules.market.integrity import MarketDataIntegrityChecker, MarketHealthStatus
+from modules.market.quote_book import QuoteBook
 from modules.market.recorder import RawMarketDataRecorder
 from modules.monitoring.latency import LatencySnapshot, LatencyTracker
 from modules.monitoring.session_report import ShadowSessionReporter, ShadowSessionData
@@ -124,10 +126,15 @@ class ExecutionEngine:
         self._total_risk_rejections = 0
         self._total_orders_submitted = 0
         self._total_exceptions = 0
+        self._total_bidask_received = 0
         self._first_tick_time: Optional[datetime] = None
         self._last_tick_time: Optional[datetime] = None
         self._process_start: Optional[datetime] = None
         self._process_end: Optional[datetime] = None
+
+        # Quote Book for top-of-book state joining & freshness verification
+        self.quote_book = QuoteBook()
+        self._market_data_source: Optional[Any] = None
 
         # Hook broker callbacks
         self.broker.register_order_callback(self._on_broker_order_update)
@@ -140,15 +147,15 @@ class ExecutionEngine:
         self.event_queue.subscribe(self._process_dequeued_tick)
         self.event_queue.on_overflow = self._on_queue_overflow
 
-    def _on_queue_overflow(self, tick: TickEvent, metrics: QueueMetrics) -> None:
+    def _on_queue_overflow(self, event: Union[TickEvent, BidAskEvent], metrics: QueueMetrics) -> None:
         """Handles queue overflow incident: mark data unhealthy and halt entries."""
-        logger.critical(f"Queue overflow detected for {tick.symbol}! Capacity={metrics.capacity}, dropped={metrics.dropped_count}")
-        self.integrity_checker.record_incident(tick.symbol, "QUEUE_OVERFLOW")
-        self.supervisor.trigger_degraded(f"EventQueue overflow: {metrics.dropped_count} ticks dropped")
+        logger.critical(f"Queue overflow detected for {event.symbol}! Capacity={metrics.capacity}, dropped={metrics.dropped_count}")
+        self.integrity_checker.record_incident(event.symbol, "QUEUE_OVERFLOW")
+        self.supervisor.trigger_degraded(f"EventQueue overflow: {metrics.dropped_count} events dropped")
 
     def on_tick(self, tick: TickEvent) -> bool:
         """
-        Ultra-lightweight market data quote callback.
+        Ultra-lightweight market data trade tick callback.
         Normalizes tick with enqueue timestamp and pushes to bounded event queue.
         Returns immediately without blocking or computing downstream logic.
         """
@@ -160,19 +167,60 @@ class ExecutionEngine:
             self._last_tick_time = tick.timestamp
         return self.event_queue.enqueue(tick)
 
-    def _process_dequeued_tick(self, tick: TickEvent) -> None:
+    def on_bidask(self, bidask: BidAskEvent) -> bool:
         """
-        Consumes dequeued tick from event queue:
-        1. Measure queue and network latencies using monotonic clocks
-        2. Validate tick against integrity invariants
-        3. Persist raw tick in Parquet recorder
-        4. Update broker top-of-book bid/ask quotes
-        5. Aggregate into 1-minute BarBuilder
+        Ultra-lightweight market data BidAsk quote callback.
+        Normalizes BidAsk with enqueue timestamp and pushes to bounded event queue.
+        Returns immediately without blocking or computing downstream logic.
+        """
+        with self._lock:
+            if not self._is_running or self._is_stopping:
+                return False
+            self._total_bidask_received += 1
+        return self.event_queue.enqueue(bidask)
+
+    def _process_dequeued_tick(self, event: Union[TickEvent, BidAskEvent]) -> None:
+        """
+        Consumes dequeued market event from event queue:
+        Handles both TickEvent (trade execution) and BidAskEvent (top-of-book depth).
         """
         with self._lock:
             if not self._is_running and not self._is_stopping:
                 return
 
+        # -----------------------------------------------------------------
+        # A. BidAsk Depth Event
+        # -----------------------------------------------------------------
+        if isinstance(event, BidAskEvent):
+            bidask = event
+            # 1. Market-data integrity check
+            is_valid, rejection_reason = self.integrity_checker.validate_bidask(bidask)
+            if not is_valid:
+                logger.warning(f"Integrity check rejected BidAsk for {bidask.symbol}: {rejection_reason}")
+                return
+
+            # 2. Update consolidated QuoteBook
+            self.quote_book.update_bidask(bidask)
+
+            # 3. Raw BidAsk recorder (buffered, append-only Parquet)
+            if self.recorder and hasattr(self.recorder, "record_bidask"):
+                self.recorder.record_bidask(bidask)
+
+            # 4. Top-of-book spread awareness for paper execution
+            if isinstance(self.broker, PaperBrokerAdapter):
+                self.broker.set_market_quote(
+                    symbol=bidask.symbol,
+                    price=None,
+                    bid_price=bidask.bid_price,
+                    ask_price=bidask.ask_price,
+                )
+            return
+
+        # -----------------------------------------------------------------
+        # B. Trade Tick Event
+        # -----------------------------------------------------------------
+        tick = event
+        with self._lock:
             # 1. Latency tracking
             self.latency_tracker.record_tick_latencies(
                 exchange_ts=tick.timestamp,
@@ -190,11 +238,14 @@ class ExecutionEngine:
                 logger.warning(f"Integrity check rejected tick for {tick.symbol}: {rejection_reason}")
                 return
 
-            # 3. Raw tick recorder (buffered, append-only)
+            # 3. Update consolidated QuoteBook
+            self.quote_book.update_tick(tick)
+
+            # 4. Raw tick recorder (buffered, append-only Parquet)
             if self.recorder:
                 self.recorder.record_tick(tick)
 
-            # 4. Bid/Ask top-of-book awareness for paper execution
+            # 5. Bid/Ask top-of-book awareness for paper execution
             if isinstance(self.broker, PaperBrokerAdapter):
                 self.broker.set_market_quote(
                     symbol=tick.symbol,
@@ -203,7 +254,7 @@ class ExecutionEngine:
                     ask_price=tick.ask_price,
                 )
 
-            # 5. Bar aggregation with monotonic timing
+            # 6. Bar aggregation with monotonic timing
             t_bar_start_ns = time.perf_counter_ns()
             self.bar_builder.on_tick_event(tick)
             t_bar_ms = (time.perf_counter_ns() - t_bar_start_ns) / 1_000_000.0
@@ -211,13 +262,19 @@ class ExecutionEngine:
 
     def connect_market_data(self, quote_source: Any) -> None:
         """
-        Connects an external market data feed (e.g. Shioaji quote feed) to the internal BarBuilder.
+        Connects an external market data feed (e.g. Shioaji quote feed) to the internal engine.
         Enables SHADOW MODE: Real market data feeding Paper execution.
         """
         with self._lock:
+            self._market_data_source = quote_source
+            registered = []
             if hasattr(quote_source, "register_tick_callback"):
                 quote_source.register_tick_callback(self.on_tick)
-                logger.info("Connected market data feed to ExecutionEngine BarBuilder (Shadow Mode active).")
+                registered.append("Tick")
+            if hasattr(quote_source, "register_bidask_callback"):
+                quote_source.register_bidask_callback(self.on_bidask)
+                registered.append("BidAsk")
+            logger.info(f"Connected market data feed ({', '.join(registered)}) to ExecutionEngine (Shadow Mode active).")
 
     def register_strategy(self, strategy: BaseStrategy) -> None:
         with self._lock:
@@ -363,11 +420,11 @@ class ExecutionEngine:
 
     def _persist_current_state(self) -> None:
         all_orders = self.order_manager.get_all_orders()
-        fills: List[Fill] = []  # Can be expanded
+        all_fills = [fill for o in all_orders for fill in getattr(o, "fills", [])]
         self.persistence.save_state(
             positions=self._positions,
             orders=all_orders,
-            fills=fills,
+            fills=all_fills,
             realized_pnl=sum(p.realized_pnl for p in self._positions.values()),
             daily_trades=self.risk_engine._daily_trades_count,
             session_status="HALTED" if self.risk_engine.kill_switch.is_halted() else "RUNNING",
@@ -488,6 +545,20 @@ class ExecutionEngine:
         )
 
         # Evaluate against RiskEngine with latency instrumentation
+        bidask_healthy = True
+        quote = self.quote_book.get_quote(signal.symbol)
+        if quote is not None and quote.has_book:
+            if not self.quote_book.is_bidask_fresh(signal.symbol, max_age_seconds=15.0, current_time=bar.timestamp):
+                bidask_healthy = False
+            elif not self.integrity_checker.is_bidask_healthy(signal.symbol):
+                bidask_healthy = False
+        elif self._market_data_source is not None and hasattr(self._market_data_source, "register_bidask_callback"):
+            # A dual-stream live quote source (e.g. ShioajiMarketDataSource) is connected and expects BidAsk
+            if not self.integrity_checker.is_bidask_healthy(signal.symbol):
+                bidask_healthy = False
+            elif quote is None or not quote.has_book:
+                bidask_healthy = False
+
         t_risk_start_ns = time.perf_counter_ns()
         decision = self.risk_engine.evaluate_order(
             request=request,
@@ -497,6 +568,7 @@ class ExecutionEngine:
             current_time=bar.timestamp,
             strategy_ready=strategy_ready,
             market_data_healthy=market_data_healthy,
+            bidask_healthy=bidask_healthy,
         )
         t_risk_ms = (time.perf_counter_ns() - t_risk_start_ns) / 1_000_000.0
         self.latency_tracker.record_stage_latency("risk_evaluation", t_risk_ms)
@@ -889,6 +961,8 @@ class ExecutionEngine:
                 soak_mode=self.soak_mode,
                 provenance={
                     "strategy_ids": list(self._strategies.keys()),
+                    "market_data_source": self._market_data_source.get_status() if self._market_data_source and hasattr(self._market_data_source, "get_status") else None,
+                    "bidask_events_received": self._total_bidask_received,
                 },
                 latency_snapshot=lat_snapshot,
             )

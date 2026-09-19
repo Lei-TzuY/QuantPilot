@@ -10,12 +10,13 @@ import logging
 import threading
 from typing import Dict, List, Optional, Tuple
 
-from modules.execution.events import TickEvent
+from modules.execution.events import BidAskEvent, TickEvent
 
 logger = logging.getLogger("QuantPilot.MarketIntegrity")
 
 
 class MarketHealthStatus(str, Enum):
+    INITIALIZING = "INITIALIZING"
     HEALTHY = "HEALTHY"
     DEGRADED = "DEGRADED"
     STALE = "STALE"
@@ -26,17 +27,26 @@ class MarketHealthStatus(str, Enum):
 class SymbolDataHealth:
     symbol: str
     status: MarketHealthStatus = MarketHealthStatus.HEALTHY
+    tick_stream_health: MarketHealthStatus = MarketHealthStatus.INITIALIZING
+    bidask_stream_health: MarketHealthStatus = MarketHealthStatus.INITIALIZING
     last_exchange_timestamp: Optional[datetime] = None
     last_receive_timestamp: Optional[datetime] = None
+    last_tick_timestamp: Optional[datetime] = None
+    last_bidask_timestamp: Optional[datetime] = None
     last_sequence: int = 0
     last_price: float = 0.0
     total_ticks_received: int = 0
     total_ticks_valid: int = 0
     total_ticks_rejected: int = 0
+    total_bidask_received: int = 0
+    total_bidask_valid: int = 0
+    total_bidask_rejected: int = 0
     duplicate_count: int = 0
     out_of_order_count: int = 0
     stale_count: int = 0
+    bidask_stale_count: int = 0
     price_anomaly_count: int = 0
+    bidask_anomaly_count: int = 0
     reconnect_gaps_count: int = 0
     last_anomaly_reason: Optional[str] = None
     last_anomaly_timestamp: Optional[datetime] = None
@@ -76,7 +86,15 @@ class MarketDataIntegrityChecker:
             (is_valid: bool, rejection_reason: Optional[str])
         """
         with self._lock:
-            now = current_time or datetime.now()
+            if current_time is not None:
+                now = current_time
+                if tick.timestamp.tzinfo is not None and now.tzinfo is None:
+                    now = now.replace(tzinfo=tick.timestamp.tzinfo)
+                elif tick.timestamp.tzinfo is None and now.tzinfo is not None:
+                    now = now.replace(tzinfo=None)
+            else:
+                now = datetime.now(tick.timestamp.tzinfo) if tick.timestamp.tzinfo else datetime.now()
+
             health = self._get_or_create(tick.symbol)
             health.total_ticks_received += 1
 
@@ -174,11 +192,95 @@ class MarketDataIntegrityChecker:
             # All checks passed! Update healthy state
             health.total_ticks_valid += 1
             health.last_exchange_timestamp = tick.timestamp
+            health.last_tick_timestamp = tick.timestamp
             health.last_receive_timestamp = tick.receive_timestamp or now
             health.last_sequence = tick.sequence
             health.last_price = tick.price
-            if not health.has_incident:
+            health.tick_stream_health = MarketHealthStatus.HEALTHY
+            if tick.bid_price is not None and tick.ask_price is not None and tick.bid_price > 0 and tick.ask_price > 0:
+                health.last_bidask_timestamp = tick.timestamp
+                health.bidask_stream_health = MarketHealthStatus.HEALTHY
+            if not health.has_incident and health.status != MarketHealthStatus.DISCONNECTED:
                 health.status = MarketHealthStatus.HEALTHY
+            return True, None
+
+    def validate_bidask(self, bidask: BidAskEvent, current_time: Optional[datetime] = None) -> Tuple[bool, Optional[str]]:
+        """
+        Validates incoming BidAskEvent depth/top-of-book data.
+        Returns (is_valid, rejection_reason).
+        """
+        with self._lock:
+            if current_time is not None:
+                now = current_time
+                if bidask.timestamp.tzinfo is not None and now.tzinfo is None:
+                    now = now.replace(tzinfo=bidask.timestamp.tzinfo)
+                elif bidask.timestamp.tzinfo is None and now.tzinfo is not None:
+                    now = now.replace(tzinfo=None)
+            else:
+                now = datetime.now(bidask.timestamp.tzinfo) if bidask.timestamp.tzinfo else datetime.now()
+
+            health = self._get_or_create(bidask.symbol)
+            health.total_bidask_received += 1
+
+            # 1. Price validity
+            if bidask.bid_price <= 0 or bidask.ask_price <= 0:
+                health.total_bidask_rejected += 1
+                health.bidask_anomaly_count += 1
+                health.bidask_stream_health = MarketHealthStatus.DEGRADED
+                reason = f"INVALID_BIDASK_PRICE: bid={bidask.bid_price}, ask={bidask.ask_price}"
+                health.last_anomaly_reason = reason
+                health.last_anomaly_timestamp = now
+                logger.warning(f"[{bidask.symbol}] Integrity failure: {reason}")
+                return False, reason
+
+            # 2. Volume validity
+            if bidask.bid_volume < 0 or bidask.ask_volume < 0:
+                health.total_bidask_rejected += 1
+                health.bidask_anomaly_count += 1
+                health.bidask_stream_health = MarketHealthStatus.DEGRADED
+                reason = f"INVALID_BIDASK_VOLUME: bid_vol={bidask.bid_volume}, ask_vol={bidask.ask_volume}"
+                health.last_anomaly_reason = reason
+                health.last_anomaly_timestamp = now
+                return False, reason
+
+            # 3. Crossed market check (bid > ask is only valid during pre-market auction / simtrade)
+            if bidask.bid_price > bidask.ask_price and not bidask.simtrade:
+                health.total_bidask_rejected += 1
+                health.bidask_anomaly_count += 1
+                health.bidask_stream_health = MarketHealthStatus.DEGRADED
+                reason = f"CROSSED_BIDASK_SPREAD: bid {bidask.bid_price} > ask {bidask.ask_price}"
+                health.last_anomaly_reason = reason
+                health.last_anomaly_timestamp = now
+                logger.warning(f"[{bidask.symbol}] Crossed spread anomaly: {reason}")
+                return False, reason
+
+            # 4. Out-of-order timestamp check
+            if health.last_bidask_timestamp and bidask.timestamp < health.last_bidask_timestamp:
+                health.total_bidask_rejected += 1
+                health.out_of_order_count += 1
+                health.bidask_stream_health = MarketHealthStatus.DEGRADED
+                reason = f"BIDASK_TIMESTAMP_REGRESSION: incoming {bidask.timestamp} < last {health.last_bidask_timestamp}"
+                health.last_anomaly_reason = reason
+                health.last_anomaly_timestamp = now
+                return False, reason
+
+            # 5. Staleness check
+            if self.max_stale_seconds > 0:
+                age = (now - bidask.timestamp).total_seconds()
+                if current_time is not None or (0 < age <= 7200):
+                    if age > self.max_stale_seconds:
+                        health.total_bidask_rejected += 1
+                        health.bidask_stale_count += 1
+                        health.bidask_stream_health = MarketHealthStatus.STALE
+                        reason = f"STALE_BIDASK: age {age:.1f}s > max {self.max_stale_seconds}s"
+                        health.last_anomaly_reason = reason
+                        health.last_anomaly_timestamp = now
+                        return False, reason
+
+            # All BidAsk checks passed
+            health.total_bidask_valid += 1
+            health.last_bidask_timestamp = bidask.timestamp
+            health.bidask_stream_health = MarketHealthStatus.HEALTHY
             return True, None
 
     def record_incident(self, symbol: str, reason: str) -> None:
@@ -195,9 +297,13 @@ class MarketDataIntegrityChecker:
             if symbol:
                 h = self._get_or_create(symbol)
                 h.status = MarketHealthStatus.DISCONNECTED
+                h.tick_stream_health = MarketHealthStatus.DISCONNECTED
+                h.bidask_stream_health = MarketHealthStatus.DISCONNECTED
             else:
                 for h in self._symbol_health.values():
                     h.status = MarketHealthStatus.DISCONNECTED
+                    h.tick_stream_health = MarketHealthStatus.DISCONNECTED
+                    h.bidask_stream_health = MarketHealthStatus.DISCONNECTED
 
     def record_reconnect(self, symbol: Optional[str] = None) -> None:
         with self._lock:
@@ -206,11 +312,15 @@ class MarketDataIntegrityChecker:
                 h.reconnect_gaps_count += 1
                 h.has_incident = False
                 h.status = MarketHealthStatus.HEALTHY
+                h.tick_stream_health = MarketHealthStatus.HEALTHY
+                h.bidask_stream_health = MarketHealthStatus.HEALTHY
             else:
                 for h in self._symbol_health.values():
                     h.reconnect_gaps_count += 1
                     h.has_incident = False
                     h.status = MarketHealthStatus.HEALTHY
+                    h.tick_stream_health = MarketHealthStatus.HEALTHY
+                    h.bidask_stream_health = MarketHealthStatus.HEALTHY
 
     def get_health(self, symbol: str) -> MarketHealthStatus:
         with self._lock:
@@ -219,7 +329,36 @@ class MarketDataIntegrityChecker:
             return self._symbol_health[symbol].status
 
     def is_symbol_healthy(self, symbol: str) -> bool:
-        return self.get_health(symbol) == MarketHealthStatus.HEALTHY
+        with self._lock:
+            if symbol not in self._symbol_health:
+                return True
+            h = self._symbol_health[symbol]
+            # Must not be DEGRADED, STALE, or DISCONNECTED
+            if h.status != MarketHealthStatus.HEALTHY:
+                return False
+            if h.bidask_stream_health in (MarketHealthStatus.STALE, MarketHealthStatus.DEGRADED, MarketHealthStatus.DISCONNECTED):
+                return False
+            return True
+
+    def is_bidask_healthy(self, symbol: str) -> bool:
+        with self._lock:
+            if symbol not in self._symbol_health:
+                return True
+            h = self._symbol_health[symbol]
+            return h.bidask_stream_health not in (
+                MarketHealthStatus.STALE,
+                MarketHealthStatus.DEGRADED,
+                MarketHealthStatus.DISCONNECTED,
+            )
+
+    def get_stream_health(self, symbol: str) -> Dict[str, MarketHealthStatus]:
+        with self._lock:
+            h = self._get_or_create(symbol)
+            return {
+                "tick": h.tick_stream_health,
+                "bidask": h.bidask_stream_health,
+                "overall": h.status,
+            }
 
     def get_symbol_report(self, symbol: str) -> Optional[SymbolDataHealth]:
         with self._lock:

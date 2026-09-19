@@ -5,7 +5,7 @@ Event-driven quantitative trading domain events.
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 class EventType(str, Enum):
@@ -40,6 +40,7 @@ class TickEvent:
     symbol: str
     price: float
     volume: float
+    total_volume: Optional[float] = None
     bid_price: Optional[float] = None
     ask_price: Optional[float] = None
     bid_volume: Optional[float] = None
@@ -53,6 +54,28 @@ class TickEvent:
     tick_type: str = "trade"
     source: str = "shioaji"
     simtrade: bool = False
+    intraday_odd: bool = False
+    is_replay: bool = False
+
+
+@dataclass(frozen=True)
+class BidAskEvent:
+    timestamp: datetime  # Exchange timestamp
+    symbol: str
+    bid_price: float     # Best bid price (top of book)
+    ask_price: float     # Best ask price (top of book)
+    bid_volume: float    # Best bid volume
+    ask_volume: float    # Best ask volume
+    bid_depth: Optional[List[Dict[str, float]]] = None
+    ask_depth: Optional[List[Dict[str, float]]] = None
+    receive_timestamp: Optional[datetime] = None
+    enqueue_timestamp: Optional[datetime] = None
+    dequeue_timestamp: Optional[datetime] = None
+    enqueue_ns: Optional[int] = None
+    dequeue_ns: Optional[int] = None
+    sequence: int = 0
+    simtrade: bool = False
+    source: str = "shioaji"
     is_replay: bool = False
 
 

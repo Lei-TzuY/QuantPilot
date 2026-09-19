@@ -110,6 +110,26 @@ def run_soak_session(
 
     clock = VirtualClock() if normalized_mode == "REALTIME_REPLAY" else SystemClock()
 
+    journal_path = f"data/journal/soak_journal_{session_date}.db"
+    state_path = f"data/state/soak_state_{session_date}.json"
+    os.makedirs(os.path.dirname(journal_path), exist_ok=True)
+    os.makedirs(os.path.dirname(state_path), exist_ok=True)
+    if os.path.exists(journal_path):
+        try:
+            os.remove(journal_path)
+        except OSError:
+            pass
+    if os.path.exists(state_path):
+        try:
+            os.remove(state_path)
+        except OSError:
+            pass
+
+    from modules.execution.journal import ExecutionJournal
+    from modules.execution.persistence import ExecutionStatePersistence
+    journal = ExecutionJournal(db_path=journal_path)
+    persistence = ExecutionStatePersistence(storage_path=state_path)
+
     engine = ExecutionEngine(
         broker=paper_broker,
         risk_engine=risk_engine,
@@ -118,6 +138,8 @@ def run_soak_session(
         soak_mode=normalized_mode,
         data_source_type="synthetic" if normalized_mode != "WALL_CLOCK_SHADOW_SOAK" else "live",
         clock=clock,
+        journal=journal,
+        persistence=persistence,
     )
     strategy = SoakDemonstrationStrategy()
     engine.register_strategy(strategy)

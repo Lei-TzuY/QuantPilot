@@ -59,6 +59,8 @@ data/*.csv
 data/*.json
 data/reports/
 data/market/
+data/state/
+data/journal/
 !data/.gitkeep
 
 # Models

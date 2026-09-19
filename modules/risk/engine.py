@@ -60,6 +60,7 @@ class RiskEngine:
         current_time: Optional[datetime] = None,
         strategy_ready: Optional[bool] = None,
         market_data_healthy: Optional[bool] = None,
+        bidask_healthy: Optional[bool] = None,
     ) -> RiskDecision:
         """
         Pre-trade risk gate. Evaluates an OrderRequest against all configured limits.
@@ -82,6 +83,14 @@ class RiskEngine:
                     allowed=False,
                     reason=f"UNHEALTHY_MARKET_DATA: Market data stream for {request.symbol} is not in HEALTHY state",
                     rule_violated="UNHEALTHY_MARKET_DATA",
+                )
+
+            # 0c. Stale BidAsk Spread Check
+            if bidask_healthy is False:
+                return RiskDecision(
+                    allowed=False,
+                    reason=f"STALE_BIDASK_SPREAD: Market BidAsk stream for {request.symbol} is stale or degraded",
+                    rule_violated="STALE_BIDASK_SPREAD",
                 )
 
             # 1. Kill Switch Check

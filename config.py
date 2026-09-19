@@ -90,13 +90,28 @@ class Config:
     RISK_MAX_PRICE_DEVIATION_PCT = float(os.getenv("RISK_MAX_PRICE_DEVIATION_PCT", "0.08"))
     RISK_MAX_STALE_DATA_SECONDS = float(os.getenv("RISK_MAX_STALE_DATA_SECONDS", "60.0"))
 
-    # 永豐 Shioaji 券商設定 (Shioaji Broker Settings)
+    # 永豐 Shioaji 券商與行情設定 (Shioaji Settings)
+    MARKET_DATA_SOURCE = os.getenv("MARKET_DATA_SOURCE", "synthetic").lower()  # synthetic, shioaji, parquet_replay
     SHIOAJI_API_KEY = os.getenv("SHIOAJI_API_KEY", "")
     SHIOAJI_SECRET_KEY = os.getenv("SHIOAJI_SECRET_KEY", "")
     SHIOAJI_CERT_PATH = os.getenv("SHIOAJI_CERT_PATH", "")
     SHIOAJI_CERT_PASSWORD = os.getenv("SHIOAJI_CERT_PASSWORD", "")
     SHIOAJI_PERSON_ID = os.getenv("SHIOAJI_PERSON_ID", "")
     SHIOAJI_SIMULATION = os.getenv("SHIOAJI_SIMULATION", "True").lower() == "true"
+
+    @classmethod
+    def get_masked_shioaji_config(cls) -> dict:
+        """Returns safe representation of Shioaji configuration with masked secrets."""
+        key = cls.SHIOAJI_API_KEY
+        masked_key = f"{key[:4]}***{key[-4:]}" if len(key) >= 8 else ("***" if key else "")
+        return {
+            "market_data_source": cls.MARKET_DATA_SOURCE,
+            "api_key_configured": bool(cls.SHIOAJI_API_KEY),
+            "api_key_masked": masked_key,
+            "secret_key_configured": bool(cls.SHIOAJI_SECRET_KEY),
+            "simulation": cls.SHIOAJI_SIMULATION,
+            "ca_cert_configured": bool(cls.SHIOAJI_CERT_PATH),
+        }
 
 
 class DevelopmentConfig(Config):

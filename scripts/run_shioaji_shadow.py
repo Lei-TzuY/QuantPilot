@@ -19,6 +19,7 @@ import signal
 import sys
 import time
 import tracemalloc
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 # Ensure repository root is on sys.path
@@ -49,50 +50,125 @@ TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 class ShadowBurnInStrategy(BaseStrategy):
     """
     Deterministic, realistic burn-in strategy for shadow testing.
-    Uses short-window momentum (EMA/close comparison) to generate realistic PAPER orders
-    exercising Strategy -> Risk -> OMS -> PaperBroker -> Fees -> Tax -> Reconciliation
-    without creating extreme order churn.
+    Maintains independent per-symbol bar history and position state to prevent cross-symbol contamination.
+    Uses short-window momentum to generate realistic PAPER orders exercising:
+    Strategy -> Risk -> OMS -> PaperBroker -> Fees -> Tax -> Reconciliation.
     """
 
-    def __init__(self, lookback: int = 5):
+    def __init__(self, lookback: int = 5, max_history: int = 100):
         super().__init__("shioaji_shadow_burn_in")
         self.lookback = lookback
-        self.bars = []
-        self._position_side = "FLAT"
+        self.max_history = max_history
+        self.bars_by_symbol: Dict[str, List[BarEvent]] = {}
+        self.position_state_by_symbol: Dict[str, str] = {}
 
-    def on_bar(self, bar: BarEvent):
+    @property
+    def bars(self) -> List[BarEvent]:
+        """Backwards-compatible flattened list of all bars across symbols."""
+        all_b: List[BarEvent] = []
+        for bl in self.bars_by_symbol.values():
+            all_b.extend(bl)
+        return sorted(all_b, key=lambda b: b.timestamp)
+
+    def get_symbol_bars(self, symbol: str) -> List[BarEvent]:
+        return self.bars_by_symbol.get(symbol, [])
+
+    def get_symbol_position_side(self, symbol: str) -> str:
+        return self.position_state_by_symbol.get(symbol, "FLAT")
+
+    def on_bar(self, bar: BarEvent) -> Optional[SignalEvent]:
         super().on_bar(bar)
-        self.bars.append(bar)
-        if len(self.bars) < self.lookback:
+        sym = bar.symbol
+        if sym not in self.bars_by_symbol:
+            self.bars_by_symbol[sym] = []
+            self.position_state_by_symbol[sym] = "FLAT"
+
+        sym_bars = self.bars_by_symbol[sym]
+        sym_bars.append(bar)
+        if len(sym_bars) > self.max_history:
+            sym_bars.pop(0)
+
+        if len(sym_bars) < self.lookback:
             return None
 
-        recent_closes = [b.close for b in self.bars[-self.lookback:]]
+        recent_closes = [b.close for b in sym_bars[-self.lookback:]]
         ma = sum(recent_closes) / len(recent_closes)
         curr = bar.close
+        pos_side = self.position_state_by_symbol[sym]
 
-        # Long entry when price crosses above MA and flat
-        if curr > ma * 1.001 and self._position_side == "FLAT":
-            self._position_side = "LONG"
+        # Long entry when price crosses above MA and flat for THIS symbol
+        if curr > ma * 1.001 and pos_side == "FLAT":
+            self.position_state_by_symbol[sym] = "LONG"
             return SignalEvent(
-                signal_id=f"SIG-BUY-{bar.symbol}-{bar.timestamp.strftime('%H%M%S')}",
+                signal_id=f"SIG-BUY-{sym}-{bar.timestamp.strftime('%H%M%S')}",
                 timestamp=bar.timestamp,
-                symbol=bar.symbol,
+                symbol=sym,
                 side="BUY",
                 strength=1.0,
                 strategy_id=self.strategy_id,
             )
-        # Exit when price crosses below MA and long
-        elif curr < ma * 0.999 and self._position_side == "LONG":
-            self._position_side = "FLAT"
+        # Exit when price crosses below MA and long for THIS symbol
+        elif curr < ma * 0.999 and pos_side == "LONG":
+            self.position_state_by_symbol[sym] = "FLAT"
             return SignalEvent(
-                signal_id=f"SIG-SELL-{bar.symbol}-{bar.timestamp.strftime('%H%M%S')}",
+                signal_id=f"SIG-SELL-{sym}-{bar.timestamp.strftime('%H%M%S')}",
                 timestamp=bar.timestamp,
-                symbol=bar.symbol,
+                symbol=sym,
                 side="SELL",
                 strength=1.0,
                 strategy_id=self.strategy_id,
             )
         return None
+
+
+def resolve_simulation_mode(cli_simulation: Optional[bool] = None) -> bool:
+    """
+    Resolves whether Shioaji market data source should run in simulation or production.
+    Precedence:
+        1. Explicit CLI override (--simulation or --no-simulation / --production)
+        2. Environment variable SHIOAJI_SIMULATION
+        3. Config.SHIOAJI_SIMULATION
+        4. Safe default: True
+    """
+    if cli_simulation is not None:
+        return bool(cli_simulation)
+    env_val = os.getenv("SHIOAJI_SIMULATION")
+    if env_val is not None:
+        return env_val.strip().lower() in ("true", "1", "yes")
+    return getattr(Config, "SHIOAJI_SIMULATION", True)
+
+
+def show_configuration(
+    symbols: list,
+    paper_cash: float,
+    simulation: bool,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+) -> None:
+    """Prints safe, masked configuration proof for shadow execution."""
+    resolved_api_key = api_key or Config.SHIOAJI_API_KEY or ""
+    resolved_secret_key = secret_key or Config.SHIOAJI_SECRET_KEY or ""
+    masked_key = (
+        f"{resolved_api_key[:4]}***{resolved_api_key[-4:]}"
+        if len(resolved_api_key) >= 8
+        else ("***" if resolved_api_key else "<not configured>")
+    )
+    feed_mode = "SIMULATION" if simulation else "PRODUCTION (REAL FEED)"
+
+    print("=================================================================")
+    print("QuantPilot SHADOW Mode - Configuration Dry-Run Proof")
+    print("=================================================================")
+    print(f"Trading Mode:          SHADOW")
+    print(f"Execution Broker:      PaperBrokerAdapter (PaperBroker)")
+    print(f"Market Data Source:    ShioajiMarketDataSource (Shioaji)")
+    print(f"Feed Environment:      {feed_mode}")
+    print(f"Live Execution:        DISABLED (Autonomous live orders unreachable)")
+    print(f"Symbols Subscribed:    {symbols}")
+    print(f"Paper Initial Cash:    ${paper_cash:,.2f} TWD")
+    print(f"API Key Configured:    {'Yes' if resolved_api_key else 'No'} ({masked_key})")
+    print(f"Secret Key Configured: {'Yes' if resolved_secret_key else 'No'}")
+    print(f"CA Cert Configured:    {'Yes' if Config.SHIOAJI_CERT_PATH else 'No (Not needed for quote shadow)'}")
+    print("=================================================================")
 
 
 def run_shioaji_shadow(
@@ -117,9 +193,18 @@ def run_shioaji_shadow(
     os.environ["BROKER_TYPE"] = "paper"
     os.environ["ENABLE_LIVE_TRADING"] = "false"
 
+    # Verify credentials exist before starting
+    resolved_api_key = api_key or Config.SHIOAJI_API_KEY
+    resolved_secret_key = secret_key or Config.SHIOAJI_SECRET_KEY
+    if not resolved_api_key or not resolved_secret_key:
+        raise ValueError(
+            "Shioaji API key and secret key must be configured in environment (.env) "
+            "or passed via CLI (--api-key, --secret-key) before starting shadow session."
+        )
+
     tracemalloc.start()
     clock = SystemClock()
-    market_clock = MarketClock(clock=clock)
+    market_clock = MarketClock()
 
     # 1. Market Data Recorder (if enabled)
     recorder = RawMarketDataRecorder(base_dir="data/market") if record else None
@@ -184,11 +269,33 @@ def run_shioaji_shadow(
         # Start engine first (worker thread active)
         engine.start(reconcile_on_startup=False)
 
+        feed_mode_str = "SIMULATION" if simulation else "PRODUCTION (REAL FEED)"
+        logger.info(f"Market Data Feed Mode: {feed_mode_str}")
+        logger.info("Execution Broker: PaperBrokerAdapter (STRICTLY PAPER / ZERO LIVE ORDERS)")
+
         # Connect quote transport & subscribe
-        logger.info("Authenticating with SinoPac Shioaji quote transport...")
-        shioaji_source.connect()
+        logger.info(f"Authenticating with SinoPac Shioaji quote transport ({feed_mode_str})...")
+        connected = shioaji_source.connect()
+        if not connected or not shioaji_source.is_connected():
+            raise ConnectionError(f"Failed to connect to Shioaji market data source ({feed_mode_str}).")
+
+        # Fast-fail if production mode was requested but source reports simulation mode
+        if not simulation and shioaji_source.simulation:
+            raise RuntimeError(
+                "FATAL: Production quote mode was requested, but market data source is operating in simulation mode."
+            )
+
+        logger.info(f"Subscribing Tick + BidAsk depth for symbols: {symbols}...")
         shioaji_source.subscribe(symbols)
-        logger.info(f"Successfully subscribed Tick + BidAsk for {symbols}")
+
+        # Confirm subscription state
+        missing_ticks = [s for s in symbols if s not in shioaji_source.subscribed_tick_symbols]
+        missing_bidask = [s for s in symbols if s not in shioaji_source.subscribed_bidask_symbols]
+        if missing_ticks or missing_bidask:
+            raise RuntimeError(
+                f"Subscription verification failed. Missing Ticks: {missing_ticks}, Missing BidAsk: {missing_bidask}"
+            )
+        logger.info(f"Confirmed subscription state: {len(symbols)} symbols subscribed for both Tick and BidAsk streams.")
 
         start_time = datetime.now(TAIPEI_TZ)
         max_end_time = start_time + timedelta(minutes=duration_minutes)
@@ -266,14 +373,51 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="QuantPilot Shioaji Shadow Runner")
     parser.add_argument("--symbols", type=str, default="2330,2454", help="Comma-separated stock symbols")
     parser.add_argument("--paper-cash", type=float, default=1_000_000.0, help="Initial paper trading cash")
-    parser.add_argument("--record", action="store_true", default=True, help="Record raw tick and bidask parquet streams")
+    parser.add_argument(
+        "--record",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Record raw tick and bidask parquet streams",
+    )
     parser.add_argument("--duration-minutes", type=int, default=270, help="Max run duration in minutes")
-    parser.add_argument("--simulation", action="store_true", default=True, help="Use Shioaji simulation environment")
+    parser.add_argument(
+        "--simulation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use Shioaji simulation environment (use --no-simulation for production feed)",
+    )
+    parser.add_argument(
+        "--production",
+        action="store_true",
+        help="Shortcut for --no-simulation (connects to real production quote feed)",
+    )
+    parser.add_argument(
+        "--show-config",
+        action="store_true",
+        help="Display safe masked configuration proof and exit without trading (dry run)",
+    )
     parser.add_argument("--api-key", type=str, default=None, help="Shioaji API Key (or use SHIOAJI_API_KEY env)")
     parser.add_argument("--secret-key", type=str, default=None, help="Shioaji Secret Key (or use SHIOAJI_SECRET_KEY env)")
 
     args = parser.parse_args()
     syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
+
+    # Resolve simulation / production precedence
+    if args.production:
+        cli_sim = False
+    else:
+        cli_sim = args.simulation
+    simulation = resolve_simulation_mode(cli_sim)
+
+    if args.show_config:
+        show_configuration(
+            symbols=syms,
+            paper_cash=args.paper_cash,
+            simulation=simulation,
+            api_key=args.api_key,
+            secret_key=args.secret_key,
+        )
+        sys.exit(0)
 
     run_shioaji_shadow(
         symbols=syms,
@@ -282,5 +426,5 @@ if __name__ == "__main__":
         duration_minutes=args.duration_minutes,
         api_key=args.api_key,
         secret_key=args.secret_key,
-        simulation=args.simulation,
+        simulation=simulation,
     )

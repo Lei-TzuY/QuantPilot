@@ -75,12 +75,17 @@ class PaperBrokerAdapter(BrokerAdapter):
     def set_market_quote(
         self,
         symbol: str,
-        price: float,
+        price: Optional[float] = None,
         bid_price: Optional[float] = None,
         ask_price: Optional[float] = None,
+        bid_volume: Optional[float] = None,
+        ask_volume: Optional[float] = None,
     ) -> None:
         """
         Injects top-of-book quote (last trade, best bid, best ask).
+        
+        A BidAsk-only update (where price is None) updates top-of-book spread and volumes
+        without overwriting or deleting the last known traded price.
         
         LIMITATION NOTE:
         PaperBroker simulates execution using top-of-book best bid/ask quotes.
@@ -88,14 +93,26 @@ class PaperBrokerAdapter(BrokerAdapter):
         due to absence of Level 2/3 exchange order-book market feeds.
         """
         with self._lock:
-            self._latest_prices[symbol] = price
+            if price is not None:
+                self._latest_prices[symbol] = price
+
+            existing_quote = self._latest_quotes.get(symbol, {})
+            last_p = price if price is not None else (existing_quote.get("last") or self._latest_prices.get(symbol))
+            best_bid = bid_price if bid_price is not None else existing_quote.get("bid")
+            best_ask = ask_price if ask_price is not None else existing_quote.get("ask")
+            best_bid_vol = bid_volume if bid_volume is not None else existing_quote.get("bid_volume")
+            best_ask_vol = ask_volume if ask_volume is not None else existing_quote.get("ask_volume")
+
             self._latest_quotes[symbol] = {
-                "last": price,
-                "bid": bid_price,
-                "ask": ask_price,
+                "last": last_p,
+                "bid": best_bid,
+                "ask": best_ask,
+                "bid_volume": best_bid_vol,
+                "ask_volume": best_ask_vol,
             }
             # Check if any pending limit orders trigger with new quote
-            self._check_pending_limit_orders(symbol, price, bid_price, ask_price)
+            eval_price = last_p if (last_p is not None and last_p > 0) else 0.0
+            self._check_pending_limit_orders(symbol, eval_price, best_bid, best_ask)
 
     def set_market_price(self, symbol: str, price: float) -> None:
         """Backwards-compatible market price injection."""
@@ -105,7 +122,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         with self._lock:
             total_equity = self.cash
             for sym, pos in self._positions.items():
-                mkt_price = self._latest_prices.get(sym, pos.avg_price)
+                mkt_price = self._latest_prices.get(sym) or pos.avg_price
                 total_equity += pos.market_value(mkt_price)
 
             return {
@@ -129,7 +146,7 @@ class PaperBrokerAdapter(BrokerAdapter):
                     realized_pnl=p.realized_pnl,
                     total_commission=p.total_commission,
                     total_tax=p.total_tax,
-                    last_price=self._latest_prices.get(sym, p.last_price),
+                    last_price=self._latest_prices.get(sym) or p.last_price or p.avg_price,
                     updated_at=p.updated_at,
                 )
                 for sym, p in self._positions.items()

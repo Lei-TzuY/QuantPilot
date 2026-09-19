@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from zoneinfo import ZoneInfo
 
 from modules.brokers.paper import PaperBrokerAdapter
@@ -433,6 +434,263 @@ class TestShioajiMarketDataSource(unittest.TestCase):
         self.assertEqual(len(b_table), 5)
         self.assertIn("bid_price", b_table.column_names)
         self.assertIn("ask_price", b_table.column_names)
+
+    def test_11_cli_simulation_mode_precedence(self):
+        """Proves CLI simulation/production precedence: CLI override > env var > safe default."""
+        from scripts.run_shioaji_shadow import resolve_simulation_mode
+
+        # 1. No CLI override + env False => False
+        with unittest.mock.patch.dict(os.environ, {"SHIOAJI_SIMULATION": "False"}):
+            self.assertFalse(resolve_simulation_mode(cli_simulation=None))
+
+        # 2. No CLI override + env True => True
+        with unittest.mock.patch.dict(os.environ, {"SHIOAJI_SIMULATION": "True"}):
+            self.assertTrue(resolve_simulation_mode(cli_simulation=None))
+
+        # 3. Explicit CLI override True with env False => True
+        with unittest.mock.patch.dict(os.environ, {"SHIOAJI_SIMULATION": "False"}):
+            self.assertTrue(resolve_simulation_mode(cli_simulation=True))
+
+        # 4. Explicit CLI override False with env True => False
+        with unittest.mock.patch.dict(os.environ, {"SHIOAJI_SIMULATION": "True"}):
+            self.assertFalse(resolve_simulation_mode(cli_simulation=False))
+
+        # 5. Default when env not set => True (safe default)
+        env_without_sim = dict(os.environ)
+        env_without_sim.pop("SHIOAJI_SIMULATION", None)
+        with unittest.mock.patch.dict(os.environ, env_without_sim, clear=True):
+            self.assertTrue(resolve_simulation_mode(cli_simulation=None))
+
+    def test_12_multi_symbol_strategy_isolation(self):
+        """Proves independent per-symbol bar history, MA calculations, position state, and bounded history."""
+        from scripts.run_shioaji_shadow import ShadowBurnInStrategy
+
+        strategy = ShadowBurnInStrategy(lookback=5, max_history=10)
+        t_base = datetime(2026, 9, 19, 9, 30, 0, tzinfo=TAIPEI_TZ)
+
+        # Interleave 5 bars for 2330 (around 950.0) and 2454 (around 1200.0)
+        signals_2330 = []
+        signals_2454 = []
+
+        for i in range(5):
+            t = t_base + timedelta(minutes=i)
+            # 2330 bar
+            b_2330 = BarEvent(timestamp=t, symbol="2330", open=950.0, high=955.0, low=948.0, close=950.0, volume=100)
+            sig_a = strategy.on_bar(b_2330)
+            if sig_a:
+                signals_2330.append(sig_a)
+
+            # 2454 bar
+            b_2454 = BarEvent(timestamp=t, symbol="2454", open=1200.0, high=1205.0, low=1195.0, close=1200.0, volume=200)
+            sig_b = strategy.on_bar(b_2454)
+            if sig_b:
+                signals_2454.append(sig_b)
+
+        # Confirm bar counts per symbol
+        self.assertEqual(len(strategy.get_symbol_bars("2330")), 5)
+        self.assertEqual(len(strategy.get_symbol_bars("2454")), 5)
+
+        # Confirm 2330 MA is calculated only from 2330 bars (~950), and 2454 MA only from 2454 bars (~1200)
+        bars_2330 = strategy.get_symbol_bars("2330")
+        bars_2454 = strategy.get_symbol_bars("2454")
+        self.assertAlmostEqual(sum(b.close for b in bars_2330) / 5, 950.0)
+        self.assertAlmostEqual(sum(b.close for b in bars_2454) / 5, 1200.0)
+
+        # Now emit a surge on 2330 (> 1.001 * 950 -> 960.0) to trigger BUY for 2330
+        t_surge = t_base + timedelta(minutes=6)
+        surge_2330 = BarEvent(timestamp=t_surge, symbol="2330", open=955.0, high=962.0, low=954.0, close=960.0, volume=150)
+        sig_2330 = strategy.on_bar(surge_2330)
+
+        self.assertIsNotNone(sig_2330)
+        self.assertEqual(sig_2330.symbol, "2330")
+        self.assertEqual(sig_2330.side, "BUY")
+        self.assertEqual(strategy.get_symbol_position_side("2330"), "LONG")
+
+        # CRITICAL ISOLATION CHECK: 2454 position side MUST remain FLAT!
+        self.assertEqual(strategy.get_symbol_position_side("2454"), "FLAT")
+
+        # Now emit a surge on 2454 (> 1.001 * 1200 -> 1215.0)
+        surge_2454 = BarEvent(timestamp=t_surge, symbol="2454", open=1205.0, high=1220.0, low=1202.0, close=1215.0, volume=250)
+        sig_2454 = strategy.on_bar(surge_2454)
+
+        # 2330 LONG does NOT block 2454 BUY!
+        self.assertIsNotNone(sig_2454)
+        self.assertEqual(sig_2454.symbol, "2454")
+        self.assertEqual(sig_2454.side, "BUY")
+        self.assertEqual(strategy.get_symbol_position_side("2454"), "LONG")
+
+        # Test bounded historical bar storage (max_history=10)
+        for j in range(10):
+            strategy.on_bar(BarEvent(timestamp=t_surge + timedelta(minutes=j + 1), symbol="2330", open=960.0, high=960.0, low=960.0, close=960.0, volume=10))
+        self.assertLessEqual(len(strategy.get_symbol_bars("2330")), 10)
+
+    def test_13_paper_broker_bidask_only_preserves_last_price(self):
+        """Proves BidAsk-only updates (price=None) preserve last traded price and maintain valid account/positions."""
+        paper_broker = PaperBrokerAdapter(initial_cash=1_000_000.0)
+        paper_broker.connect()
+
+        # 1. Tick arrives @ 1000.0
+        paper_broker.set_market_quote("2330", price=1000.0)
+        self.assertEqual(paper_broker._latest_prices["2330"], 1000.0)
+        self.assertEqual(paper_broker._latest_quotes["2330"]["last"], 1000.0)
+
+        # 2. BidAsk update arrives with price=None: bid=999.0, ask=1001.0
+        paper_broker.set_market_quote(
+            symbol="2330",
+            price=None,
+            bid_price=999.0,
+            ask_price=1001.0,
+            bid_volume=80.0,
+            ask_volume=120.0,
+        )
+
+        # 3. Last trade must remain 1000.0 (NOT erased or set to None!)
+        self.assertEqual(paper_broker._latest_prices["2330"], 1000.0)
+        self.assertEqual(paper_broker._latest_quotes["2330"]["last"], 1000.0)
+        self.assertEqual(paper_broker._latest_quotes["2330"]["bid"], 999.0)
+        self.assertEqual(paper_broker._latest_quotes["2330"]["ask"], 1001.0)
+        self.assertEqual(paper_broker._latest_quotes["2330"]["bid_volume"], 80.0)
+        self.assertEqual(paper_broker._latest_quotes["2330"]["ask_volume"], 120.0)
+
+        # 4. get_account() must remain completely valid without errors
+        acct = paper_broker.get_account()
+        self.assertEqual(acct["cash"], 1_000_000.0)
+        self.assertEqual(acct["total_equity"], 1_000_000.0)
+
+        # 5. Submit Market BUY order: must execute against Ask (1001.0)
+        from modules.execution.order import OrderRequest, OrderSide, OrderType
+        req_buy = OrderRequest(
+            symbol="2330",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=100,
+            strategy_id="test_strat",
+        )
+        from modules.execution.order_manager import OrderManager
+        oms = OrderManager()
+        order_buy = oms.create_order(req_buy)
+        filled_buy = paper_broker.submit_order(order_buy)
+
+        self.assertEqual(filled_buy.status.value, "FILLED")
+        # Execution price conforms to Taiwan tick applied to ask (1001.0 -> 1005.0)
+        self.assertGreaterEqual(filled_buy.average_fill_price, 1001.0)
+
+        # Check positions mark-to-market does not receive None
+        pos = paper_broker.get_positions()
+        self.assertIn("2330", pos)
+        self.assertIsNotNone(pos["2330"].last_price)
+        self.assertEqual(pos["2330"].last_price, 1000.0)
+
+        # 6. Submit Market SELL order: must execute against Bid (999.0)
+        req_sell = OrderRequest(
+            symbol="2330",
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            quantity=100,
+            strategy_id="test_strat",
+        )
+        order_sell = oms.create_order(req_sell)
+        filled_sell = paper_broker.submit_order(order_sell)
+        self.assertEqual(filled_sell.status.value, "FILLED")
+        self.assertLessEqual(filled_sell.average_fill_price, 1000.0)
+
+    def test_14_shadow_invariant_under_production_quote_mode(self):
+        """
+        CRITICAL PRODUCTION QUOTE INVARIANT TEST:
+        Instantiates ShioajiMarketDataSource with simulation=False.
+        Proves that even when receiving genuine production quote format feeds,
+        live money execution remains structurally unreachable (place_order calls == 0).
+        """
+        # Create source with simulation=False using FakeShioajiAPI
+        prod_source = ShioajiMarketDataSource(
+            api_key="PROD_TEST_KEY",
+            secret_key="PROD_TEST_SECRET",
+            simulation=False,
+            api_instance=self.fake_api,
+        )
+        self.assertFalse(prod_source.simulation)
+
+        paper_broker = PaperBrokerAdapter(initial_cash=5_000_000.0)
+        paper_broker.connect()
+        risk_engine = RiskEngine(
+            limits=RiskLimits(max_order_value=2_000_000.0, max_position_value_per_symbol=5_000_000.0),
+            kill_switch=KillSwitch(),
+        )
+
+        engine = ExecutionEngine(
+            broker=paper_broker,
+            risk_engine=risk_engine,
+            trading_mode="shadow",
+            test_only_synchronous=True,
+            journal=ExecutionJournal(os.path.join(self.test_dir, "j_14.db")),
+            persistence=ExecutionStatePersistence(os.path.join(self.test_dir, "p_14.json")),
+        )
+        strategy = DummyStrategy()
+        engine.register_strategy(strategy)
+        engine.connect_market_data(prod_source)
+
+        engine.start(reconcile_on_startup=False)
+        prod_source.connect()
+        prod_source.subscribe(["2330"])
+
+        t_base = datetime(2026, 9, 19, 9, 30, 0, tzinfo=TAIPEI_TZ)
+
+        # Drive Tick + BidAsk through pipeline
+        for s in range(61):
+            curr_ts = t_base + timedelta(seconds=s)
+            if s % 10 == 0 or s == 60:
+                self.fake_api.quote.emit_bidask(
+                    code="2330",
+                    bid_price=949.0,
+                    ask_price=951.0,
+                    bid_volume=100,
+                    ask_volume=100,
+                    timestamp=curr_ts,
+                )
+            self.fake_api.quote.emit_tick(
+                code="2330",
+                price=950.0,
+                volume=10,
+                timestamp=curr_ts,
+            )
+
+        # Confirm paper order was placed and filled
+        positions = paper_broker.get_positions()
+        self.assertIn("2330", positions)
+        self.assertEqual(positions["2330"].quantity, engine.default_order_shares)
+
+        # ABSOLUTE SAFETY PROOF: Shioaji.place_order was NEVER invoked
+        self.assertEqual(self.fake_api.place_order_call_count, 0)
+
+        prod_source.disconnect()
+        engine.stop()
+
+    def test_15_show_config_dry_run_safety(self):
+        """Proves --show-config dry-run outputs safe masked config and never leaks secrets."""
+        import io
+        import contextlib
+        from scripts.run_shioaji_shadow import show_configuration
+
+        stdout_buf = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buf):
+            show_configuration(
+                symbols=["2330", "2454"],
+                paper_cash=2_000_000.0,
+                simulation=False,
+                api_key="MY_SECRET_API_KEY_1234",
+                secret_key="SUPER_CONFIDENTIAL_SECRET_XYZ",
+            )
+
+        output = stdout_buf.getvalue()
+        self.assertIn("SHADOW", output)
+        self.assertIn("PaperBrokerAdapter", output)
+        self.assertIn("ShioajiMarketDataSource", output)
+        self.assertIn("PRODUCTION (REAL FEED)", output)
+        self.assertIn("DISABLED", output)
+        # Verify secrets are masked and not printed in plaintext
+        self.assertNotIn("MY_SECRET_API_KEY_1234", output)
+        self.assertNotIn("SUPER_CONFIDENTIAL_SECRET_XYZ", output)
+        self.assertIn("MY_S***1234", output)
 
 
 if __name__ == "__main__":
